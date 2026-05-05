@@ -501,11 +501,30 @@ function logUsage(entry: Record<string, unknown>): void {
   appendFile(join(homedir(), ".opencode", "acp-delegate-usage.jsonl"), line).catch(() => {})
 }
 
+// ============================================================================
+// Session prompt resolution (inlined from src/index.ts)
+// ============================================================================
+
+type SessionPrompt = (opts: {
+  path: { id: string }
+  body: { parts: Array<{ type: string; text: string }> }
+}) => Promise<unknown>
+
+function resolveSessionPrompt(client: unknown): SessionPrompt | null {
+  try {
+    const fn = (client as { session: { prompt: SessionPrompt } }).session.prompt
+    return typeof fn === "function" ? fn.bind((client as { session: unknown }).session) : null
+  } catch {
+    return null
+  }
+}
+
 let callSeq = 0
 
-const plugin: Plugin = async (_input: PluginInput, options?: OpencodePluginOptions) => {
+const plugin: Plugin = async (input: PluginInput, options?: OpencodePluginOptions) => {
   const config = (options ?? {}) as unknown as PluginConfigShape
   const registry = parseAgentRegistry(config)
+  const sessionPrompt = resolveSessionPrompt(input.client)
 
   return {
     "experimental.chat.system.transform": async (_inp, output) => {
@@ -541,15 +560,17 @@ const plugin: Plugin = async (_input: PluginInput, options?: OpencodePluginOptio
         },
         execute: async (args, ctx) => {
           const callId = generateCallId(++callSeq)
-          ctx.metadata({ title: truncate(args.prompt) })
+          const sessionId = ctx.sessionID
 
           let agent: AgentConfig
           try {
             agent = resolveAgent(registry, args.agentId)
           } catch (err) {
             const errObj = err instanceof Error ? err : new Error(String(err))
-            return buildErrorNotification(callId, args.agentId ?? "(default)", errObj, args.prompt)
+            return `agent_delegate [${callId}] failed: ${errObj.message}`
           }
+
+          ctx.metadata({ title: truncate(args.prompt) })
 
           const preamble =
             args.includeContext && args.includeContext.length > 0
@@ -563,49 +584,32 @@ const plugin: Plugin = async (_input: PluginInput, options?: OpencodePluginOptio
             timeout: agent.timeout ?? DEFAULT_TIMEOUT_MS,
           }
 
-          try {
-            const result = await runOneShotSession(clientOpts, fullPrompt)
-            // Override agentId with the user-facing registry id (binary path is too noisy).
-            const labelled: OneShotResult = {
-              output: result.output,
-              metadata: { ...result.metadata, agentId: agent.id },
-            }
-            ctx.metadata({
-              metadata: {
-                callId,
-                agentId: agent.id,
-                durationMs: labelled.metadata.durationMs,
-              },
+          runOneShotSession(clientOpts, fullPrompt)
+            .then((result) => {
+              const labelled: OneShotResult = {
+                output: result.output,
+                metadata: { ...result.metadata, agentId: agent.id },
+              }
+              logUsage({ callId, agentId: agent.id, durationMs: labelled.metadata.durationMs, promptLength: args.prompt.length })
+              if (sessionPrompt) {
+                sessionPrompt({
+                  path: { id: sessionId },
+                  body: { parts: [{ type: "text", text: buildSuccessNotification(callId, labelled, args.prompt) }] },
+                }).catch(() => {})
+              }
             })
-            logUsage({
-              callId,
-              agentId: agent.id,
-              durationMs: labelled.metadata.durationMs,
-              promptLength: args.prompt.length,
+            .catch((err) => {
+              const errObj = err instanceof Error ? err : new Error(String(err))
+              logUsage({ callId, agentId: agent.id, error: errObj.message, errorCode: errObj.name, promptLength: args.prompt.length })
+              if (sessionPrompt) {
+                sessionPrompt({
+                  path: { id: sessionId },
+                  body: { parts: [{ type: "text", text: buildErrorNotification(callId, agent.id, errObj, args.prompt) }] },
+                }).catch(() => {})
+              }
             })
-            return {
-              output: buildSuccessNotification(callId, labelled, args.prompt),
-              metadata: labelled.metadata,
-            }
-          } catch (err) {
-            const errObj = err instanceof Error ? err : new Error(String(err))
-            ctx.metadata({
-              metadata: {
-                callId,
-                agentId: agent.id,
-                errorCode: errObj.name,
-                errorMessage: errObj.message,
-              },
-            })
-            logUsage({
-              callId,
-              agentId: agent.id,
-              error: errObj.message,
-              errorCode: errObj.name,
-              promptLength: args.prompt.length,
-            })
-            return buildErrorNotification(callId, agent.id, errObj, args.prompt)
-          }
+
+          return `agent_delegate [${callId}] started in background (agent: ${agent.id}). Result will arrive as <acp-delegate-result> notification.`
         },
       }),
     },
