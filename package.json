@@ -1,0 +1,55 @@
+{
+  "name": "opencode-acp-delegate",
+  "version": "0.1.0",
+  "description": "Opencode plugin that delegates tasks to any ACP-compatible agent via the Agent Client Protocol (ACP). Generic one-shot worker — any registered ACP agent becomes callable from the master agent.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "drop-in",
+    "README.md",
+    "DESIGN.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "acp",
+    "agent-client-protocol",
+    "ai",
+    "agent",
+    "delegation"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.14.0"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.21.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": ">=1.14.0",
+    "@types/node": "^20.0.0",
+    "bun-types": "^1.3.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
