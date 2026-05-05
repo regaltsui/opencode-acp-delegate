@@ -3,3 +3,8 @@ dist/
 .sisyphus/
 *.tgz
 .DS_Store
+
+# Agent knowledge-base files (opencode AGENTS.md / .agents)
+AGENTS.md
+agents.md
+.agents
