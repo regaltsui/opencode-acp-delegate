@@ -1,0 +1,27 @@
+{
+  "injectSystemGuidance": true,
+  "agents": [
+    {
+      "id": "gemini",
+      "command": ["gemini", "--acp"],
+      "description": "Reach for delegate_to_gemini for bulk read-only analysis across many files (1M-token window) or a fast second opinion from an independent model family.",
+      "whenToUse": "bulk multi-file analysis, fast second opinion",
+      "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+      "defaultModel": "gemini-2.5-flash",
+      "modelFlag": "-m"
+    },
+    {
+      "id": "claude",
+      "command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@latest"],
+      "description": "Reach for delegate_to_claude when you need deep design review, architecture critique, or careful refactoring analysis.",
+      "whenToUse": "deep design review, architecture critique",
+      "models": ["claude-opus-4-5", "claude-sonnet-4-5"],
+      "defaultModel": "claude-sonnet-4-5"
+    },
+    {
+      "id": "opencode",
+      "command": ["opencode", "acp"],
+      "whenToUse": "quick general-purpose delegation"
+    }
+  ]
+}

@@ -8,3 +8,7 @@ dist/
 AGENTS.md
 agents.md
 .agents
+
+# Local project state — user-specific, never commit
+.opencode.bk/
+.claude/
