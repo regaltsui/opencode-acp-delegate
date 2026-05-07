@@ -105,6 +105,7 @@ interface AgentConfig {
   models?: string[]
   defaultModel?: string
   modelFlag?: string
+  autoApprove?: boolean
 }
 
 interface AcpPluginOptions {
@@ -126,6 +127,7 @@ interface AcpClientOptions {
   cwd: string
   timeout: number
   signal?: AbortSignal
+  autoApprove: boolean
 }
 
 interface OneShotResult {
@@ -278,11 +280,15 @@ function validateAgent(raw: unknown, index: number): AgentConfig {
       }
     }
   }
+  if (candidate.autoApprove !== undefined && typeof candidate.autoApprove !== "boolean") {
+    throw new Error(`Agent config at index ${index} is invalid: 'autoApprove' must be a boolean when provided`)
+  }
   return {
     id: candidate.id,
     command: candidate.command as string[],
     default: candidate.default,
     timeout: candidate.timeout ?? DEFAULT_TIMEOUT_MS,
+    autoApprove: candidate.autoApprove ?? true,
     ...(candidate.label !== undefined ? { label: candidate.label } : {}),
     ...(candidate.description !== undefined ? { description: candidate.description } : {}),
     ...(candidate.whenToUse !== undefined ? { whenToUse: candidate.whenToUse } : {}),
@@ -505,6 +511,18 @@ interface ReadTextFileParams {
   limit?: unknown
 }
 
+interface PermissionOption {
+  optionId: string
+  name?: string
+  kind: "allow_once" | "allow_always" | "reject_once" | "reject_always"
+}
+
+interface RequestPermissionParams {
+  sessionId?: string
+  toolCall?: unknown
+  options?: unknown[]
+}
+
 const VALID_STOP_REASONS = new Set<AcpStopReason>([
   "end_turn",
   "max_tokens",
@@ -719,7 +737,24 @@ async function runOneShotSession(opts: AcpClientOptions, prompt: string): Promis
         return
       }
       if (msg.method === "session/request_permission" && msg.id !== undefined) {
-        sendResult(msg.id, { outcome: { outcome: "cancelled" } })
+        const params = (msg.params ?? {}) as RequestPermissionParams
+        const options = Array.isArray(params.options) ? params.options : []
+        const preferredKinds = opts.autoApprove
+          ? (["allow_once", "allow_always"] as const)
+          : (["reject_once", "reject_always"] as const)
+        let chosen: PermissionOption | undefined
+        for (const kind of preferredKinds) {
+          chosen = options.find(
+            (o): o is PermissionOption =>
+              !!o && typeof o === "object" && (o as PermissionOption).kind === kind && typeof (o as PermissionOption).optionId === "string",
+          )
+          if (chosen) break
+        }
+        if (chosen) {
+          sendResult(msg.id, { outcome: { outcome: "selected", optionId: chosen.optionId } })
+        } else {
+          sendResult(msg.id, { outcome: { outcome: "cancelled" } })
+        }
         return
       }
     }
@@ -1205,6 +1240,7 @@ async function runDelegation(
         cwd: ctx.directory,
         timeout: agent.timeout ?? DEFAULT_TIMEOUT_MS,
         signal: ctx.abort,
+        autoApprove: agent.autoApprove ?? true,
       },
       fullPrompt,
     )

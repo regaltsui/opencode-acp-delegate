@@ -116,7 +116,8 @@ These are explicit non-features in v1, not oversights.
 
 | Limitation | Detail |
 |---|---|
-| Read-only filesystem | `clientCapabilities` is sent as `{ fs: { readTextFile: true } }`. Agents can read files but not write them, run shell commands, or call MCP servers. This is a deliberate security boundary. The master also performs eager bounded reads on `includeContext` paths (see §5) — those reads happen in the plugin process under the same cwd-containment + per-file size cap. |
+| Plugin filesystem service is read-only | `clientCapabilities` is sent as `{ fs: { readTextFile: true } }`. Any FS request the agent routes through the *client* (us) is read-only, cwd-contained, and bounded. The master also performs eager bounded reads on `includeContext` paths (see §5) under the same containment + per-file size cap. The agent's *own* tools (its built-in shell/write/web) go through `session/request_permission` instead — see `autoApprove` below. |
+| Permission policy is binary, not granular | The plugin answers `session/request_permission` by selecting an `allow_once` (when `autoApprove: true`, the default) or `reject_once` (when `autoApprove: false`) option. There is no per-tool allowlist, no interactive prompt to the master agent, and no remembering of `allow_always` decisions across calls (each call is a fresh subprocess). Per-tool granular policy is on the future roadmap (§7). |
 | No persistent sessions | Each tool call spawns a fresh subprocess and drives a complete session lifecycle from scratch. There is no session reuse, no warm subprocess pool, no continuity between calls. |
 | No MCP server | This is an Opencode plugin only. There is no stdio MCP server wrapping the tools for use in Claude Desktop, Cursor, or other MCP hosts. |
 | One-shot only | A single tool call is a single `session/prompt` exchange. There is no multi-turn conversation within one tool call. The master agent is the one carrying conversational state across turns. |
@@ -215,6 +216,21 @@ In the success path the plugin attempts `session/close` only when `initializeRes
 
 If the subprocess exits before `promptResponse` arrives, the tool call fails with a structured error message returned synchronously, and `usage.jsonl` records `status: "error"`.
 
+### 6.4 Permission requests (`session/request_permission`)
+
+Most ACP agents have their own built-in tools (shell, web fetch, file write, etc.) that are *not* serviced by the client. Before invoking one, the agent sends a `session/request_permission` request whose `params.options[]` lists the choices available to the user — each option carries an `optionId`, a human-readable `name`, and a `kind ∈ { allow_once, allow_always, reject_once, reject_always }`. The expected response is `{ outcome: { outcome: "selected", optionId } }` or `{ outcome: { outcome: "cancelled" } }` (the latter signalling the user dismissed the prompt).
+
+The plugin answers automatically. Per agent, `autoApprove` (default `true`) chooses the policy:
+
+| `autoApprove` | Behavior |
+|---|---|
+| `true` (default) | Pick the first option whose `kind` is `allow_once`, else `allow_always`, else fall back to `cancelled`. |
+| `false` | Pick the first option whose `kind` is `reject_once`, else `reject_always`, else fall back to `cancelled`. |
+
+Returning `cancelled` is a last-resort fallback only when the agent provides no matching option — the previous v0.2 behavior of *always* returning `cancelled` made every shell/web/write attempt fail with a confusing "user cancelled the prompt" message back to the master. With `autoApprove: true`, agents can use their own tools normally; with `autoApprove: false`, the agent receives a clean rejection and can plan around it instead of retrying.
+
+The plugin does not currently distinguish between tool kinds — `autoApprove` applies uniformly to every permission request within a session. Granular per-tool policy is on the §7 roadmap.
+
 ## 7. Future Roadmap
 
 These are planned improvements, not commitments. Priority order is approximate. Items marked ✅ landed in v0.2.
@@ -224,7 +240,9 @@ These are planned improvements, not commitments. Priority order is approximate. 
 | Per-agent timeout config | ✅ v0.2 | `timeout` is honored per agent entry in the registry. See `AgentConfig.timeout` in [plugin/acp-delegate.ts](plugin/acp-delegate.ts). |
 | Health check on startup | ✅ v0.2 | `probeAll(registry)` is fired (not awaited) at plugin load and the result is persisted under `state.json:health[]`. The TUI's `/acp-doctor` reads this. See §10. |
 | Eager context inclusion | ✅ v0.2 | The `includeContext` schema field on each tool reads files in-process and injects a fenced preamble. See §5. |
-| Capability negotiation | Deferred | Let callers opt into more capabilities per call (e.g. `fs.writeTextFile`). Requires a trust model and probably a per-agent allowlist in config. |
+| Per-agent permission policy | ✅ v0.3 | `autoApprove` (default `true`) controls whether the plugin selects `allow_once` or `reject_once` from the options the agent provides on `session/request_permission`. See §6.4. |
+| Granular per-tool permission | Deferred | Replace the binary `autoApprove` with a per-tool allowlist (e.g. allow `read`, allow `write`, deny `webfetch`). Requires inspecting `toolCall.kind` on each request_permission call and matching against a config-supplied policy. |
+| `fs.writeTextFile` service | Deferred | Advertise `fs.writeTextFile: true` and add a write handler with cwd-containment, mirroring `readBoundedTextFile`. Less risky than auto-approving the agent's full toolset because the plugin polices the path. |
 | Streaming to master | Deferred | Surface `session/update` chunks incrementally via `ctx.metadata()` so the TUI sees partial output during long delegations. The master LLM still only sees the final tool-result string, so this is a TUI win, not a model-routing win. A title-only progress marker (bytes / elapsed) would be sufficient if implemented. |
 | Non-text parts | Deferred | Handle image and structured-data parts from `session/update`. Return them in the tool result metadata rather than discarding. |
 | Persistent subprocess pool | Deferred | Keep one warm subprocess per agent ID across calls to eliminate cold-start latency. Requires a mutex per agent and restart logic on subprocess death. Deferred until cold-start cost is demonstrated to be a real user pain point. |

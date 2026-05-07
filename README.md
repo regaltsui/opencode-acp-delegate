@@ -158,6 +158,7 @@ Field reference:
 | `models` | string[] | no | Model allowlist. When non-empty, the generated tool exposes `model` as a closed `z.enum([...])` arg — the LLM must pick from these exact ids. Hallucinated names are rejected before spawn. |
 | `defaultModel` | string | no | Used when the LLM omits the `model` arg. Must be in `models` if both are set. |
 | `modelFlag` | string | no | CLI flag used to pass the chosen model to the spawned binary. Defaults to `--model`. Set per-agent (e.g. `-m` for `gemini-cli`). |
+| `autoApprove` | boolean | no | Controls how the plugin answers the agent's `session/request_permission` calls (the requests an ACP agent makes before running its built-in shell, web, or write tools). `true` (default) selects an `allow_once` option so the agent can use its own tools. Set to `false` to select `reject_once` and lock the agent down to read-only filesystem access. |
 
 Top-level config (alongside `agents`):
 
@@ -265,7 +266,7 @@ These are explicit non-features in v1, not oversights.
 
 | Limitation | Detail |
 |---|---|
-| Read-only filesystem | Agents can read files (`fs.readTextFile`) but cannot write files, run shell commands, or call MCP servers. Other capabilities are not granted. |
+| Filesystem service offered to the agent | The plugin only services `fs.readTextFile` requests on behalf of the agent (with cwd containment). The agent's *own* tools (its built-in shell, write, web, etc.) are governed by `autoApprove` — set per-agent in config, default `true`. Set `autoApprove: false` to refuse every `session/request_permission` and effectively keep the agent read-only. |
 | No persistent sessions | Each tool call spawns a fresh agent subprocess. There is no session reuse or warm subprocess pool across calls. |
 | No MCP server | Opencode plugin only. There is no stdio MCP server wrapping the tools for use in Claude Desktop, Cursor, or other MCP hosts. |
 | One-shot only | A single tool call is a single prompt exchange. No multi-turn conversation within one call. The master agent carries conversational state across turns. |
