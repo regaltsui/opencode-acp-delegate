@@ -33,6 +33,9 @@
     "delegation"
   ],
   "license": "MIT",
+  "dependencies": {
+    "@regaltsui/acp-delegate": "github:regaltsui/acp-delegate-core"
+  },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.14.0"
   },

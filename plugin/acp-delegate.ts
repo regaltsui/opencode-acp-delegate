@@ -1,26 +1,15 @@
 /**
- * opencode-acp-delegate — ACP delegation plugin for Opencode (drop-in form)
+ * opencode-acp-delegate — ACP delegation plugin for Opencode
  *
  * Registers one tool per configured ACP agent: `delegate_to_<id>`. Each tool
- * spawns a fresh subprocess (`gemini --acp`, `opencode acp`,
- * `claude-agent-acp`, …), drives a one-shot ACP session over stdio, and
+ * drives a one-shot ACP session via @regaltsui/acp-delegate shared core and
  * returns the agent's final text response synchronously.
  *
- * DROP-IN INSTALLATION:
- *   cp acp-delegate.ts ~/.opencode/plugins/acp-delegate.ts
- *   # or for a single project:
- *   cp acp-delegate.ts .opencode/plugins/acp-delegate.ts
- *
- * No `npm install` required — the JSON-RPC client is hand-rolled on Node.js
- * built-ins (child_process, readline). Only `@opencode-ai/plugin` is imported,
- * and Opencode itself satisfies that resolver at load time.
- *
- * CONFIGURATION (drop-in form): Opencode's file-based plugin loader does NOT
- * pass tuple options to file-based plugins. Provide agents via JSON instead —
- * first match wins:
- *   1. $OPENCODE_ACP_DELEGATE_CONFIG (path to a JSON file)
- *   2. ~/.config/opencode/acp-delegate.json
- *   3. ~/.opencode/acp-delegate.json
+ * CONFIGURATION: Provide agents via JSON or as tuple options in opencode.json:
+ *   1. Tuple options (GitHub URL install in opencode.json)
+ *   2. $OPENCODE_ACP_DELEGATE_CONFIG (path to a JSON file)
+ *   3. ~/.config/opencode/acp-delegate.json
+ *   4. ~/.opencode/acp-delegate.json
  *
  * Example JSON:
  *   {
@@ -31,13 +20,6 @@
  *     ]
  *   }
  *
- * Each agent entry registers its own tool: delegate_to_gemini,
- * delegate_to_opencode, delegate_to_claude.
- *
- * CAPABILITIES: the spawned agent is allowed to read text files inside the
- * project cwd via the ACP `fs/read_text_file` request (read-only). It cannot
- * write files, run shell commands, or escape the project directory.
- *
  * STATE & TELEMETRY: lifecycle events are persisted to
  *   $XDG_STATE_HOME/opencode/acp-delegate/state.json (inflight + recent + health)
  *   $XDG_STATE_HOME/opencode/acp-delegate/usage.jsonl (per-call audit, rotates at 5 MiB)
@@ -46,33 +28,37 @@
  * SOURCE: https://github.com/regaltsui/opencode-acp-delegate
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
-import { createInterface } from "node:readline"
-import { homedir } from "node:os"
-import {
-  appendFile,
-  mkdir,
-  readFile,
-  rename,
-  stat,
-  unlink,
-  writeFile,
-} from "node:fs/promises"
-import { readFileSync, existsSync } from "node:fs"
-import { isAbsolute, dirname, join, relative, resolve as resolvePath } from "node:path"
-import { randomBytes, randomUUID } from "node:crypto"
 import {
   type Plugin,
   type PluginInput,
   type PluginOptions as OpencodePluginOptions,
+  type ToolContext,
   type ToolDefinition,
   tool,
 } from "@opencode-ai/plugin"
+import {
+  type AgentConfig,
+  type AcpPluginOptions,
+  type HealthEntry,
+  type HostAdapter,
+  OPENCODE_NAMESPACE,
+  INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES,
+  INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES,
+  readFallbackConfig,
+  validateAgent,
+  missingAgentsMessage,
+  probeAll,
+  recordHealth,
+  sanitizeToolSuffix,
+  describeAgent,
+  buildRoutingBlock,
+  runDelegation,
+} from "@regaltsui/acp-delegate"
 
 const z = tool.schema
 
 // ============================================================================
-// Constants
+// Config resolution — tuple options first, JSON file fallback
 // ============================================================================
 
 const DEFAULT_TIMEOUT_MS = 600_000
@@ -302,22 +288,22 @@ function resolvePluginOptions(opts: AcpPluginOptions): {
   agents: AgentConfig[]
   injectSystemGuidance: boolean
 } {
-  let source = opts
-  if (!source || !Array.isArray(source.agents) || source.agents.length === 0) {
-    const fallback = readFallbackConfig()
-    if (fallback) source = fallback
+  let source: AcpPluginOptions | null =
+    opts && Array.isArray(opts.agents) && opts.agents.length > 0 ? opts : null
+  if (!source) {
+    source = readFallbackConfig(OPENCODE_NAMESPACE)
   }
   if (!source || !Array.isArray(source.agents) || source.agents.length === 0) {
-    throw new Error(MISSING_AGENTS_MESSAGE)
+    throw new Error(missingAgentsMessage(OPENCODE_NAMESPACE))
   }
   return {
-    agents: source.agents.map((raw, i) => validateAgent(raw, i)),
+    agents: source.agents.map((raw, i) => validateAgent(raw as unknown, i)),
     injectSystemGuidance: source.injectSystemGuidance === true,
   }
 }
 
 // ============================================================================
-// State directory + atomic state.json writer + usage.jsonl appender (rotating)
+// Tool arg schemas
 // ============================================================================
 
 const STATE_DIR_ENV = "OPENCODE_ACP_DELEGATE_STATE_DIR"
@@ -1295,13 +1281,26 @@ const INCLUDE_CONTEXT_ARG = z
   .array(z.string().min(1))
   .optional()
   .describe(
-    "Optional. Relative paths under the project cwd (files or directories). Their contents " +
-      "are eagerly read and prepended to the prompt as <context path=\"…\"> blocks, capped at " +
+    `Optional. Relative paths under the project cwd (files or directories). Their contents ` +
+      `are eagerly read and prepended to the prompt as <context path="…"> blocks, capped at ` +
       `${INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES / 1024} KiB total / ${INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES / 1024} KiB per file. ` +
-      "Binary files and paths outside the project are skipped with a notice.",
+      `Binary files and paths outside the project are skipped with a notice.`,
   )
 
+// ============================================================================
+// Tool factory — one opencode ToolDefinition per ACP agent
+// ============================================================================
+
 function makeDelegateTool(agent: AgentConfig): ToolDefinition {
+  const makeHost = (ctx: ToolContext): HostAdapter => ({
+    getDirectory: (_args?: { directoryArg?: string }) => ctx.directory,
+    getSessionId: () => ctx.sessionID.slice(0, 6),
+    getAbortSignal: () => ctx.abort,
+    reportProgress: (m) =>
+      ctx.metadata(m as { title?: string; metadata?: Record<string, unknown> }),
+    namespace: OPENCODE_NAMESPACE,
+  })
+
   if (agent.models !== undefined && agent.models.length > 0) {
     const modelArg = z
       .enum(agent.models as [string, ...string[]])
@@ -1315,35 +1314,29 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
       )
     return tool({
       description: describeAgent(agent),
-      args: {
-        prompt: PROMPT_ARG,
-        includeContext: INCLUDE_CONTEXT_ARG,
-        model: modelArg,
-      },
-      execute: async (args, ctx) => runDelegation(agent, args, ctx),
+      args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, model: modelArg },
+      execute: async (args, ctx) => runDelegation(agent, args, makeHost(ctx)),
     })
   }
+
   return tool({
     description: describeAgent(agent),
-    args: {
-      prompt: PROMPT_ARG,
-      includeContext: INCLUDE_CONTEXT_ARG,
-    },
-    execute: async (args, ctx) => runDelegation(agent, args, ctx),
+    args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG },
+    execute: async (args, ctx) => runDelegation(agent, args, makeHost(ctx)),
   })
 }
 
+// ============================================================================
+// Plugin entry point
+// ============================================================================
+
 const plugin: Plugin = async (_input: PluginInput, options?: OpencodePluginOptions) => {
   const config = (options ?? {}) as unknown as AcpPluginOptions
-  // resolvePluginOptions reads tuple options first, then falls back to the
-  // JSON config file (drop-in install path). Both `agents` and
-  // `injectSystemGuidance` come from whichever source supplied them, so a
-  // drop-in user's JSON file can opt into the system-prompt hook too.
   const { agents: registry, injectSystemGuidance } = resolvePluginOptions(config)
 
   // Fire-and-forget startup health probe; never blocks plugin load.
   void probeAll(registry)
-    .then((health) => setHealthResults(health).catch(() => {}))
+    .then((health: HealthEntry[]) => recordHealth(OPENCODE_NAMESPACE, health).catch(() => {}))
     .catch(() => {})
 
   const tools: Record<string, ToolDefinition> = {}

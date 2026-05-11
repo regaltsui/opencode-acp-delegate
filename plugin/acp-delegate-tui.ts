@@ -1,5 +1,5 @@
 /**
- * opencode-acp-delegate:tui — companion TUI module (single file, install-free)
+ * opencode-acp-delegate:tui — companion TUI module
  *
  * INSTALLATION (file copy):
  *   curl -fsSL https://raw.githubusercontent.com/regaltsui/opencode-acp-delegate/main/plugin/acp-delegate-tui.ts \
@@ -31,60 +31,13 @@ import type {
   TuiCommand,
 } from "@opencode-ai/plugin/tui"
 import { readFile } from "node:fs/promises"
-import { homedir } from "node:os"
 import { join } from "node:path"
-
-interface InflightEntry {
-  callId: string
-  sessionId: string
-  agentId: string
-  promptSnippet: string
-  startedAt: number
-}
-
-interface RecentEntry {
-  callId: string
-  sessionId: string
-  agentId: string
-  status: "complete" | "error" | "cancelled"
-  promptSnippet: string
-  startedAt: number
-  endedAt: number
-  durationMs: number
-  errorCode?: string
-}
-
-interface HealthEntry {
-  agentId: string
-  ok: boolean
-  durationMs: number
-  checkedAt: number
-  error?: string
-}
-
-interface AcpState {
-  version: 1
-  updatedAt: number
-  pid: number
-  inflight: InflightEntry[]
-  recent: RecentEntry[]
-  health: HealthEntry[]
-}
-
-const STATE_DIR_ENV = "OPENCODE_ACP_DELEGATE_STATE_DIR"
-const STATE_FILE_NAME = "state.json"
-
-function getStateDir(): string {
-  const explicit = process.env[STATE_DIR_ENV]
-  if (explicit && explicit.length > 0) return explicit
-  const xdg = process.env["XDG_STATE_HOME"]
-  if (xdg && xdg.length > 0) return join(xdg, "opencode", "acp-delegate")
-  return join(homedir(), ".local", "state", "opencode", "acp-delegate")
-}
-
-function getStateFilePath(): string {
-  return join(getStateDir(), STATE_FILE_NAME)
-}
+import {
+  type AcpState,
+  getStateDir,
+  STATE_FILE_NAME,
+  OPENCODE_NAMESPACE,
+} from "@regaltsui/acp-delegate"
 
 function emptyState(): AcpState {
   return {
@@ -99,7 +52,7 @@ function emptyState(): AcpState {
 
 async function loadState(): Promise<AcpState> {
   try {
-    const raw = await readFile(getStateFilePath(), "utf8")
+    const raw = await readFile(join(getStateDir(OPENCODE_NAMESPACE), STATE_FILE_NAME), "utf8")
     const parsed = JSON.parse(raw) as Partial<AcpState>
     return {
       version: 1,
