@@ -28,6 +28,7 @@
  * SOURCE: https://github.com/regaltsui/opencode-acp-delegate
  */
 
+import { randomBytes, randomUUID } from "node:crypto"
 import {
   type Plugin,
   type PluginInput,
