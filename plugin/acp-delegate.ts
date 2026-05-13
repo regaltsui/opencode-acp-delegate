@@ -28,7 +28,31 @@
  * SOURCE: https://github.com/regaltsui/opencode-acp-delegate
  */
 
-import { randomBytes, randomUUID } from "node:crypto"
+// ---------------------------------------------------------------------------
+// Portable crypto utilities (Web Crypto API — works in Node, Deno, Bun)
+// Avoids `node:crypto` which may not resolve in non-Node plugin runtimes.
+// ---------------------------------------------------------------------------
+
+/** Generate a UUID v4 using globalThis.crypto (with manual fallback). */
+function randomUUID(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID()
+  }
+  // Fallback: UUID v4 from getRandomValues
+  const buf = new Uint8Array(16)
+  globalThis.crypto.getRandomValues(buf)
+  buf[6] = (buf[6] & 0x0f) | 0x40 // version 4
+  buf[8] = (buf[8] & 0x3f) | 0x80 // variant 10
+  const hex = Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+/** Generate `bytes` random bytes as a hex string (replaces `randomBytes(n).toString("hex")`). */
+function randomHex(bytes: number): string {
+  const buf = new Uint8Array(bytes)
+  globalThis.crypto.getRandomValues(buf)
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("")
+}
 import {
   type Plugin,
   type PluginInput,
@@ -365,7 +389,7 @@ async function saveStateAtomic(state: AcpState): Promise<void> {
   const dir = dirname(target)
   const tmpPath = join(
     dir,
-    `${STATE_FILE_NAME}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`,
+    `${STATE_FILE_NAME}.${process.pid}.${randomHex(4)}.tmp`,
   )
   const payload = { ...state, version: STATE_FILE_VERSION, updatedAt: Date.now(), pid: process.pid }
   try {
