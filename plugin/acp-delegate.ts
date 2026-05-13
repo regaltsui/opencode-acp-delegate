@@ -53,6 +53,13 @@ function randomHex(bytes: number): string {
   globalThis.crypto.getRandomValues(buf)
   return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("")
 }
+
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process"
+import { existsSync, readFileSync } from "node:fs"
+import { readFile, writeFile, mkdir, stat, unlink, rename, appendFile } from "node:fs/promises"
+import { createInterface } from "node:readline"
+import { join, dirname, relative, isAbsolute, resolve as resolvePath } from "node:path"
+import { homedir } from "node:os"
 import {
   type Plugin,
   type PluginInput,
