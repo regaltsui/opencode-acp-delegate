@@ -72,7 +72,6 @@ import {
   type AgentConfig,
   type AcpPluginOptions,
   type HealthEntry,
-  type HostAdapter,
   OPENCODE_NAMESPACE,
   INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES,
   INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES,
@@ -1324,15 +1323,6 @@ const INCLUDE_CONTEXT_ARG = z
 // ============================================================================
 
 function makeDelegateTool(agent: AgentConfig): ToolDefinition {
-  const makeHost = (ctx: ToolContext): HostAdapter => ({
-    getDirectory: (_args?: { directoryArg?: string }) => ctx.directory,
-    getSessionId: () => ctx.sessionID.slice(0, 6),
-    getAbortSignal: () => ctx.abort,
-    reportProgress: (m) =>
-      ctx.metadata?.(m as { title?: string; metadata?: Record<string, unknown> }),
-    namespace: OPENCODE_NAMESPACE,
-  })
-
   if (agent.models !== undefined && agent.models.length > 0) {
     const modelArg = z
       .enum(agent.models as [string, ...string[]])
@@ -1347,14 +1337,14 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
     return tool({
       description: describeAgent(agent),
       args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, model: modelArg },
-      execute: async (args, ctx) => runDelegation(agent, args, makeHost(ctx)),
+      execute: async (args, ctx) => runDelegation(agent, args, ctx),
     })
   }
 
   return tool({
     description: describeAgent(agent),
     args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG },
-    execute: async (args, ctx) => runDelegation(agent, args, makeHost(ctx)),
+    execute: async (args, ctx) => runDelegation(agent, args, ctx),
   })
 }
 
