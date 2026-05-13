@@ -1186,7 +1186,7 @@ async function runDelegation(
     sessionID?: string
     directory: string
     abort?: AbortSignal
-    metadata: (input: { title?: string; metadata?: Record<string, unknown> }) => void
+    metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void
   },
 ): Promise<{ output: string; metadata: Record<string, unknown> }> {
   const startedAt = Date.now()
@@ -1194,7 +1194,7 @@ async function runDelegation(
   const sessionIdShort = String(ctx.sessionID ?? "").slice(0, 6)
   const promptSnippet = snippet(args.prompt, PROMPT_SNIPPET_MAX)
 
-  ctx.metadata({ title: `[${agent.id}] ${snippet(args.prompt, TITLE_PROMPT_MAX)}` })
+  ctx.metadata?.({ title: `[${agent.id}] ${snippet(args.prompt, TITLE_PROMPT_MAX)}` })
 
   void recordInflight({
     callId,
@@ -1322,7 +1322,7 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
     getSessionId: () => ctx.sessionID.slice(0, 6),
     getAbortSignal: () => ctx.abort,
     reportProgress: (m) =>
-      ctx.metadata(m as { title?: string; metadata?: Record<string, unknown> }),
+      ctx.metadata?.(m as { title?: string; metadata?: Record<string, unknown> }),
     namespace: OPENCODE_NAMESPACE,
   })
 
