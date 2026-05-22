@@ -465,3 +465,226 @@ delegate_to_<id> refused: <agent text or "no reason given">
 ```
 
 For errors and cancellation, `output` is the human-readable failure message (timeout, ENOENT, abort, etc.) and `metadata.status` carries the structured code. Errors do NOT throw — execute always returns a result. Throwing would make the master agent give up rather than retry.
+
+## 13. Unified `acp_delegate` Tool
+
+### 13.1 Purpose
+
+The per-agent tool model (`delegate_to_gemini`, `delegate_to_claude`, etc.) works well when the master agent always knows which agent to call. However, some workflows benefit from a single entry point that routes automatically based on task characteristics rather than requiring the caller to pick a specific agent:
+
+- The master can pass `complexity="high"` and let the routing table decide which agent and model to use — no need to reason about agent-specific model names.
+- Fewer tool definitions appear in the tool list, reducing prompt overhead when the registry is large.
+- The master can delegate with just a prompt and let defaults handle the rest.
+
+The unified `acp_delegate` tool coexists with per-agent tools — enabling it does **not** remove the existing `delegate_to_<id>` tools. Hosts opt in via the `enableUnifiedTool` config flag.
+
+### 13.2 Tool schema
+
+The `acp_delegate` tool exposes all routing parameters in a single call:
+
+| Param | Type | Required | Notes |
+|---|---|---|---|
+| `prompt` | string | yes | Self-contained instruction. Same semantics as per-agent tools. |
+| `agent` | string enum | no | Agent id from the registry (e.g. `"gemini"`, `"claude"`, `"opencode"`). When omitted, the routing table selects the agent based on `complexity` (or the default tier). |
+| `model` | string | no | Explicit model id to pass to the agent. When `agent.models` is defined, the value must appear in that array. Takes precedence over `complexity`. |
+| `complexity` | enum `"high" \| "mid" \| "low"` | no | Complexity tier. When `agent` is omitted, used to look up the routing table entry. When `agent` is supplied, maps to a model via `agent.complexityModels` (same as per-agent tools). Defaults to `"mid"` when both `agent` and `complexity` are omitted. |
+| `includeContext` | string[] | no | Same semantics as per-agent tools. |
+
+### 13.3 Resolution logic
+
+When `acp_delegate` is called, the target agent and model are resolved in this order:
+
+**Step 1 — Agent resolution:**
+
+1. If `agent` is supplied → use that agent directly (validated against the registry).
+2. If `agent` is omitted → look up the routing table entry for the effective `complexity` tier (see §13.4). The routing entry provides `{ agent, model? }`.
+3. If `agent` is omitted and no routing table is configured → fall back to the agent marked `default: true`, or `agents[0]`.
+
+**Step 2 — Model resolution (after agent is known):**
+
+1. If `model` is supplied → use it directly (validated against `agent.models` if defined).
+2. If `model` is not supplied but the agent was resolved via routing table and the routing entry specifies a `model` → use that model.
+3. If neither routing `model` nor explicit `model` is supplied but `complexity` is → use `agent.complexityModels[level]` if defined, then fall back to `agent.defaultModel`.
+4. If none of the above → use `agent.defaultModel`, or omit the model flag entirely (agent's built-in default).
+
+Precedence: explicit `model` > routing entry `model` > `complexityModels[level]` > `defaultModel` > agent default.
+
+**Step 3 — Validation:**
+
+If the resolved model is not in `agent.models[]` (when defined), return an error result: `"acp_delegate failed: model '…' is not in agent '…' models […]"`.
+
+### 13.4 Routing table
+
+The routing table is an ordered array that maps `(complexity?)` → `(agent, model?)` pairs. It lives in the plugin config alongside the agents array. When `agent` is omitted from the tool call, the plugin scans the routing table in order for a matching entry.
+
+```json
+{
+  "enableUnifiedTool": true,
+  "routing": [
+    { "agent": "claude",  "model": "claude-opus-4-5",  "complexity": "high" },
+    { "agent": "claude",  "model": "claude-sonnet-4-5", "complexity": "mid" },
+    { "agent": "gemini",  "model": "gemini-2.5-flash",  "complexity": "low" },
+    { "agent": "gemini",  "model": "gemini-2.5-flash" }
+  ],
+  "agents": [ … ]
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `routing` | array | no | Ordered list of routing entries. First match wins. |
+| `routing[].agent` | string | yes | Agent id that must exist in the `agents` array. |
+| `routing[].model` | string | no | Model id passed to the agent. Must be in `agent.models[]` when defined. If omitted, the agent's default model or `complexityModels[tier]` is used. |
+| `routing[].complexity` | enum `"high" \| "mid" \| "low"` | no | Complexity tier this entry matches. If omitted, the entry matches any complexity (acts as a fallback). |
+
+**Resolution order:**
+
+1. When `agent` is omitted and `complexity` is specified → scan for entries where `entry.complexity === complexity`. First match wins.
+2. When `agent` is omitted and no complexity-specific match → scan for entries where `entry.complexity` is undefined (fallback entries). First match wins.
+3. When `agent` is omitted and no routing table entries match → fall back to the agent marked `default: true`, or `agents[0]`.
+
+The array order matters: entries earlier in the list take priority. This allows the same tier to have multiple candidates — if the first agent in a tier is unavailable, a future fallback mechanism could walk the list.
+
+When no routing table is configured, omitting `agent` falls back to the agent marked `default: true` (or `agents[0]`) with its default model.
+
+### 13.5 Config schema: `enableUnifiedTool` + `routing`
+
+The `AcpPluginOptions` gains two new fields:
+
+```json
+{
+  "enableUnifiedTool": true,
+  "routing": [
+    { "agent": "claude",  "model": "claude-opus-4-5",  "complexity": "high" },
+    { "agent": "claude",  "model": "claude-sonnet-4-5", "complexity": "mid" },
+    { "agent": "gemini",  "model": "gemini-2.5-flash",  "complexity": "low" },
+    { "agent": "gemini",  "model": "gemini-2.5-flash" }
+  ],
+  "agents": [
+    {
+      "id": "gemini",
+      "command": ["gemini", "--acp"],
+      "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+      "defaultModel": "gemini-2.5-flash",
+      "modelFlag": "-m",
+      "complexityModels": {
+        "high": "gemini-2.5-pro",
+        "mid": "gemini-2.5-flash",
+        "low": "gemini-2.5-flash"
+      }
+    },
+    {
+      "id": "claude",
+      "command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@latest"],
+      "models": ["claude-opus-4-5", "claude-sonnet-4-5"],
+      "defaultModel": "claude-sonnet-4-5",
+      "complexityModels": {
+        "high": "claude-opus-4-5",
+        "mid": "claude-sonnet-4-5",
+        "low": "claude-sonnet-4-5"
+      }
+    }
+  ]
+}
+```
+
+When both `routing` and per-agent `complexityModels` exist:
+- If `agent` is supplied → per-agent `complexityModels` applies (same as per-agent tools).
+- If `agent` is omitted → the `routing` table takes priority; the routing entry's `model` field overrides per-agent `complexityModels` for that tier.
+
+### 13.6 `complexityModels` field on AgentConfig
+
+Each agent entry has an optional `complexityModels` field (unchanged from the previous design):
+
+```json
+{
+  "id": "gemini",
+  "command": ["gemini", "--acp"],
+  "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+  "defaultModel": "gemini-2.5-flash",
+  "complexityModels": {
+    "high": "gemini-2.5-pro",
+    "mid": "gemini-2.5-flash",
+    "low": "gemini-2.5-flash"
+  }
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `complexityModels` | object | no | Maps complexity tiers to model ids. Keys must be `"high"`, `"mid"`, or `"low"`. Values must be in `models[]` when defined. |
+
+When `agent` is supplied and `model` is omitted, `complexityModels` on that agent resolves the model. The `routing` table is a separate cross-agent concept — it selects *which agent* to use for a given tier, not just which model.
+
+### 13.7 Coexistence with per-agent tools
+
+When `enableUnifiedTool: true`:
+
+- All `delegate_to_<id>` tools are still registered (backward compatibility).
+- The `acp_delegate` tool is additionally registered.
+- The system-prompt routing block (`injectSystemGuidance: true`) is augmented to mention the unified tool alongside per-agent tools.
+
+When `enableUnifiedTool: false` or absent (default):
+
+- Only `delegate_to_<id>` tools are registered (current behavior, unchanged).
+- No `acp_delegate` tool exists.
+
+### 13.8 Config example
+
+```json
+{
+  "enableUnifiedTool": true,
+  "routing": [
+    { "agent": "claude", "model": "claude-opus-4-5",  "complexity": "high" },
+    { "agent": "claude", "model": "claude-sonnet-4-5", "complexity": "mid" },
+    { "agent": "gemini", "model": "gemini-2.5-flash",  "complexity": "low" },
+    { "agent": "gemini", "model": "gemini-2.5-flash" }
+  ],
+  "agents": [
+    {
+      "id": "gemini",
+      "command": ["gemini", "--acp"],
+      "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+      "defaultModel": "gemini-2.5-flash",
+      "modelFlag": "-m",
+      "complexityModels": {
+        "high": "gemini-2.5-pro",
+        "mid": "gemini-2.5-flash",
+        "low": "gemini-2.5-flash"
+      }
+    },
+    {
+      "id": "claude",
+      "command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@latest"],
+      "models": ["claude-opus-4-5", "claude-sonnet-4-5"],
+      "defaultModel": "claude-sonnet-4-5",
+      "complexityModels": {
+        "high": "claude-opus-4-5",
+        "mid": "claude-sonnet-4-5",
+        "low": "claude-sonnet-4-5"
+      }
+    }
+  ]
+}
+```
+
+### 13.9 Tool result shape
+
+The `acp_delegate` tool returns the same result shape as per-agent tools:
+
+```ts
+{
+  output: string,
+  metadata: {
+    agentId: string
+    durationMs: number
+    status: "complete" | "error" | "cancelled"
+    stopReason?: "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled"
+    errorCode?: string
+    model?: string
+    complexity?: "high" | "mid" | "low"
+  }
+}
+```
+
+The `metadata.agentId` identifies which agent was actually used (especially important when agent was auto-selected via routing). The `metadata.complexity` echoes the tier when supplied. Trailers use `acp_delegate` (not `delegate_to_<id>`) for unified-tool calls.

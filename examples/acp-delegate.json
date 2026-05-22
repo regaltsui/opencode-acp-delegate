@@ -1,5 +1,12 @@
 {
   "injectSystemGuidance": true,
+  "enableUnifiedTool": true,
+  "routing": [
+    { "agent": "claude",  "model": "claude-opus-4-5",  "complexity": "high" },
+    { "agent": "claude",  "model": "claude-sonnet-4-5", "complexity": "mid" },
+    { "agent": "gemini",  "model": "gemini-2.5-flash",  "complexity": "low" },
+    { "agent": "gemini",  "model": "gemini-2.5-flash" }
+  ],
   "agents": [
     {
       "id": "gemini",
@@ -8,7 +15,12 @@
       "whenToUse": "bulk multi-file analysis, fast second opinion",
       "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
       "defaultModel": "gemini-2.5-flash",
-      "modelFlag": "-m"
+      "modelFlag": "-m",
+      "complexityModels": {
+        "high": "gemini-2.5-pro",
+        "mid": "gemini-2.5-flash",
+        "low": "gemini-2.5-flash"
+      }
     },
     {
       "id": "claude",
@@ -16,7 +28,12 @@
       "description": "Reach for delegate_to_claude when you need deep design review, architecture critique, or careful refactoring analysis.",
       "whenToUse": "deep design review, architecture critique",
       "models": ["claude-opus-4-5", "claude-sonnet-4-5"],
-      "defaultModel": "claude-sonnet-4-5"
+      "defaultModel": "claude-sonnet-4-5",
+      "complexityModels": {
+        "high": "claude-opus-4-5",
+        "mid": "claude-sonnet-4-5",
+        "low": "claude-sonnet-4-5"
+      }
     },
     {
       "id": "opencode",

@@ -90,13 +90,29 @@ interface AgentConfig {
   whenToUse?: string
   models?: string[]
   defaultModel?: string
+  complexityModels?: { high?: string; mid?: string; low?: string }
   modelFlag?: string
   autoApprove?: boolean
 }
 
+type ComplexityTier = "high" | "mid" | "low"
+
+interface RoutingEntry {
+  /** Agent id — must exist in the agents array. */
+  agent: string
+  /** Model id passed to the agent. If omitted, the agent's defaultModel or complexityModels[level] is used. */
+  model?: string
+  /** Complexity tier this entry matches. If omitted, this entry matches any complexity (used as a fallback). */
+  complexity?: ComplexityTier
+}
+
+type RoutingTable = RoutingEntry[]
+
 interface AcpPluginOptions {
   agents: AgentConfig[]
   injectSystemGuidance?: boolean
+  enableUnifiedTool?: boolean
+  routing?: RoutingTable
 }
 
 type AcpStopReason =
@@ -266,6 +282,26 @@ function validateAgent(raw: unknown, index: number): AgentConfig {
       }
     }
   }
+  if (candidate.complexityModels !== undefined) {
+    if (typeof candidate.complexityModels !== "object" || candidate.complexityModels === null || Array.isArray(candidate.complexityModels)) {
+      throw new Error(`Agent config at index ${index} is invalid: 'complexityModels' must be an object when provided`)
+    }
+    const validTiers = new Set<string>(["high", "mid", "low"])
+    for (const key of Object.keys(candidate.complexityModels)) {
+      if (!validTiers.has(key)) {
+        throw new Error(`Agent config at index ${index} is invalid: complexityModels has unknown key '${key}' (allowed: high, mid, low)`)
+      }
+      const val = (candidate.complexityModels as Record<string, unknown>)[key]
+      if (val !== undefined) {
+        if (typeof val !== "string" || val.length === 0) {
+          throw new Error(`Agent config at index ${index} is invalid: complexityModels.${key} must be a non-empty string when provided`)
+        }
+        if (Array.isArray(candidate.models) && candidate.models.length > 0 && !candidate.models.includes(val as string)) {
+          throw new Error(`Agent config at index ${index} is invalid: complexityModels.${key} '${val}' is not in models [${candidate.models.join(", ")}]`)
+        }
+      }
+    }
+  }
   if (candidate.autoApprove !== undefined && typeof candidate.autoApprove !== "boolean") {
     throw new Error(`Agent config at index ${index} is invalid: 'autoApprove' must be a boolean when provided`)
   }
@@ -280,6 +316,7 @@ function validateAgent(raw: unknown, index: number): AgentConfig {
     ...(candidate.whenToUse !== undefined ? { whenToUse: candidate.whenToUse } : {}),
     ...(candidate.models !== undefined ? { models: [...candidate.models] } : {}),
     ...(candidate.defaultModel !== undefined ? { defaultModel: candidate.defaultModel } : {}),
+    ...(candidate.complexityModels !== undefined ? { complexityModels: { ...candidate.complexityModels } } : {}),
     ...(candidate.modelFlag !== undefined ? { modelFlag: candidate.modelFlag } : {}),
   }
 }
@@ -287,6 +324,8 @@ function validateAgent(raw: unknown, index: number): AgentConfig {
 function resolvePluginOptions(opts: AcpPluginOptions): {
   agents: AgentConfig[]
   injectSystemGuidance: boolean
+  enableUnifiedTool: boolean
+  routing: RoutingTable | undefined
 } {
   let source: AcpPluginOptions | null =
     opts && Array.isArray(opts.agents) && opts.agents.length > 0 ? opts : null
@@ -296,10 +335,59 @@ function resolvePluginOptions(opts: AcpPluginOptions): {
   if (!source || !Array.isArray(source.agents) || source.agents.length === 0) {
     throw new Error(missingAgentsMessage(OPENCODE_NAMESPACE))
   }
+  const routing = validateRouting(source.routing, source.agents)
   return {
     agents: source.agents.map((raw, i) => validateAgent(raw as unknown, i)),
     injectSystemGuidance: source.injectSystemGuidance === true,
+    enableUnifiedTool: source.enableUnifiedTool === true,
+    routing,
   }
+}
+
+function validateRouting(routing: RoutingTable | undefined, agents: unknown[]): RoutingTable | undefined {
+  if (routing === undefined) return undefined
+  if (!Array.isArray(routing)) {
+    throw new Error("Plugin config: 'routing' must be an array when provided")
+  }
+  const agentConfigs = new Map(agents.map((a: unknown) => {
+    const cfg = a as { id: string; models?: string[] }
+    return [cfg.id, cfg] as const
+  }))
+  const validTiers = new Set<string>(["high", "mid", "low"])
+  const result: RoutingEntry[] = []
+  for (let i = 0; i < routing.length; i++) {
+    const entry = routing[i]
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`Plugin config: routing[${i}] must be an object`)
+    }
+    const e = entry as unknown as Record<string, unknown>
+    if (typeof e.agent !== "string" || e.agent.length === 0) {
+      throw new Error(`Plugin config: routing[${i}].agent must be a non-empty string`)
+    }
+    const agentCfg = agentConfigs.get(e.agent)
+    if (agentCfg === undefined) {
+      throw new Error(`Plugin config: routing[${i}].agent '${e.agent}' is not in agents list [${Array.from(agentConfigs.keys()).join(", ")}]`)
+    }
+    if (e.model !== undefined) {
+      if (typeof e.model !== "string" || e.model.length === 0) {
+        throw new Error(`Plugin config: routing[${i}].model must be a non-empty string when provided`)
+      }
+      if (Array.isArray(agentCfg.models) && agentCfg.models.length > 0 && !agentCfg.models.includes(e.model as string)) {
+        throw new Error(`Plugin config: routing[${i}].model '${e.model}' is not in agent '${e.agent}' models [${agentCfg.models.join(", ")}]`)
+      }
+    }
+    if (e.complexity !== undefined) {
+      if (typeof e.complexity !== "string" || !validTiers.has(e.complexity as string)) {
+        throw new Error(`Plugin config: routing[${i}].complexity must be 'high', 'mid', or 'low' when provided`)
+      }
+    }
+    result.push({
+      agent: e.agent,
+      ...(e.model !== undefined ? { model: e.model as string } : {}),
+      ...(e.complexity !== undefined ? { complexity: e.complexity as ComplexityTier } : {}),
+    })
+  }
+  return result
 }
 
 // ============================================================================
@@ -1122,13 +1210,71 @@ function buildSpawnCommand(agent: AgentConfig, requestedModel: string | undefine
   return [...agent.command, flag, chosen]
 }
 
+function resolveEffectiveModel(
+  agent: AgentConfig,
+  opts: { model?: string; complexity?: ComplexityTier },
+): string | undefined {
+  // Explicit model takes precedence.
+  if (opts.model !== undefined) return opts.model
+  // Complexity tier maps to a model via complexityModels.
+  if (opts.complexity !== undefined && agent.complexityModels !== undefined) {
+    const tier = agent.complexityModels[opts.complexity]
+    if (tier !== undefined) return tier
+  }
+  // Fall back to agent defaultModel, or undefined (agent's built-in default).
+  return agent.defaultModel
+}
+
+// ============================================================================
+// resolveRoute — when agent is omitted, look up routing table for the
+// effective complexity tier.  Falls back to the agent marked default:true
+// or agents[0].
+// ============================================================================
+
+function resolveRoute(
+  routing: RoutingTable | undefined,
+  agents: AgentConfig[],
+  complexity: ComplexityTier | undefined,
+): { agent: AgentConfig; model: string | undefined } {
+  const tier: ComplexityTier = complexity ?? "mid"
+
+  // Scan the routing table for matching entries in order.
+  if (routing !== undefined && routing.length > 0) {
+    // First pass: exact match on both agent (if hinted) and complexity.
+    // We don't filter by agent here because resolveRoute is called when
+    // agent is omitted — we want the routing table to pick the agent.
+    for (const entry of routing) {
+      if (entry.complexity === tier) {
+        const agent = agents.find((a) => a.id === entry.agent)
+        if (agent !== undefined) {
+          return { agent, model: entry.model }
+        }
+      }
+    }
+    // Second pass: entries without complexity (they match any tier).
+    for (const entry of routing) {
+      if (entry.complexity === undefined) {
+        const agent = agents.find((a) => a.id === entry.agent)
+        if (agent !== undefined) {
+          return { agent, model: entry.model }
+        }
+      }
+    }
+  }
+
+  // No routing entry matched. Fall back to default agent.
+  // Return model: undefined so resolveEffectiveModel handles complexityModels.
+  const fallback = agents.find((a) => a.default) ?? agents[0]
+  return { agent: fallback, model: undefined }
+}
+
 function snippet(prompt: string, max: number): string {
   const cleaned = prompt.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim()
   return cleaned.length <= max ? cleaned : cleaned.slice(0, max - 1) + "\u2026"
 }
 
 function applyStopReasonTrailer(
-  agentId: string,
+  toolPrefix: string,
   output: string,
   stopReason: AcpStopReason | undefined,
   durationMs: number,
@@ -1136,12 +1282,12 @@ function applyStopReasonTrailer(
   if (stopReason === undefined || stopReason === "end_turn") return { output, status: "complete" }
   if (stopReason === "refusal") {
     const reason = output.trim().length > 0 ? output.trim() : "no reason given"
-    return { output: `delegate_to_${agentId} refused: ${reason}`, status: "error" }
+    return { output: `${toolPrefix} refused: ${reason}`, status: "error" }
   }
   if (stopReason === "cancelled") {
-    return { output: `delegate_to_${agentId} cancelled by agent.`, status: "cancelled" }
+    return { output: `${toolPrefix} cancelled by agent.`, status: "cancelled" }
   }
-  const trailer = `\n\n[delegate_to_${agentId}: stopReason=${stopReason}, durationMs=${durationMs}]`
+  const trailer = `\n\n[${toolPrefix}: stopReason=${stopReason}, durationMs=${durationMs}]`
   return { output: output + trailer, status: "complete" }
 }
 
@@ -1163,7 +1309,9 @@ async function runDelegation(
     abort?: AbortSignal
     metadata: (input: { title?: string; metadata?: Record<string, unknown> }) => void
   },
+  toolPrefix?: string,
 ): Promise<{ output: string; metadata: Record<string, unknown> }> {
+  const prefix = toolPrefix ?? `delegate_to_${agent.id}`
   const startedAt = Date.now()
   const callId = randomUUID()
   const sessionIdShort = String(ctx.sessionID ?? "").slice(0, 6)
@@ -1232,7 +1380,7 @@ async function runDelegation(
     )
     const durationMs = result.metadata.durationMs
     const { output, status } = applyStopReasonTrailer(
-      agent.id,
+      prefix,
       result.output,
       result.metadata.stopReason,
       durationMs,
@@ -1247,7 +1395,7 @@ async function runDelegation(
   } catch (err) {
     const durationMs = Date.now() - startedAt
     if (err instanceof AcpAbortError) {
-      const output = `delegate_to_${agent.id} cancelled.`
+      const output = `${prefix} cancelled.`
       return finalize({
         output,
         status: "cancelled",
@@ -1258,7 +1406,7 @@ async function runDelegation(
     }
     const e = err instanceof AcpError ? err : new AcpError(String(err))
     const stderrTail = e.stderr ? `\n--- agent stderr (tail) ---\n${e.stderr}` : ""
-    const output = `delegate_to_${agent.id} failed (${e.code ?? e.name}): ${e.message}${stderrTail}`
+    const output = `${prefix} failed (${e.code ?? e.name}): ${e.message}${stderrTail}`
     return finalize({
       output,
       status: "error",
@@ -1301,13 +1449,65 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
     namespace: OPENCODE_NAMESPACE,
   })
 
-  if (agent.models !== undefined && agent.models.length > 0) {
+  const hasModels = agent.models !== undefined && agent.models.length > 0
+  const hasComplexity = agent.complexityModels !== undefined &&
+    Object.values(agent.complexityModels).some((v) => typeof v === "string" && v.length > 0)
+
+  // Build the complexity arg when complexityModels is populated.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let complexityArg: any = undefined
+  if (hasComplexity) {
+    const populatedTiers = (["high", "mid", "low"] as const).filter((t) => {
+      const v = agent.complexityModels?.[t]
+      return typeof v === "string" && v.length > 0
+    })
+    if (populatedTiers.length > 0) {
+      complexityArg = z
+        .enum(populatedTiers as [string, ...string[]])
+        .optional()
+        .describe(
+          `Optional. Complexity tier that selects a model via the agent's 'complexityModels' map. ` +
+          `Ignored when 'model' is also supplied. ` +
+          `Tiers: ${populatedTiers.map((t) => `${t} → ${agent.complexityModels![t]}`).join(", ")}.`,
+        )
+    }
+  }
+
+  // Both models + complexity
+  if (hasModels && complexityArg !== undefined) {
+    const models = agent.models!
     const modelArg = z
-      .enum(agent.models as [string, ...string[]])
+      .enum(models as [string, ...string[]])
       .optional()
       .describe(
         `Optional. Model id passed to the agent via '${agent.modelFlag ?? "--model"}'. ` +
-          `Allowed values: ${agent.models.join(", ")}. ` +
+          `Allowed values: ${models.join(", ")}. ` +
+          (agent.defaultModel !== undefined
+            ? `Defaults to '${agent.defaultModel}' when omitted.`
+            : "Omit to use the agent's built-in default."),
+      )
+    return tool({
+      description: describeAgent(agent),
+      args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, model: modelArg, complexity: complexityArg },
+      execute: async (rawArgs, ctx) => {
+        const args = rawArgs as { prompt: string; includeContext?: string[]; model?: string; complexity?: ComplexityTier }
+        const effectiveModel = resolveEffectiveModel(agent, { model: args.model, complexity: args.complexity })
+        const result = await runDelegation(agent, { prompt: args.prompt, includeContext: args.includeContext, model: effectiveModel }, makeHost(ctx))
+        if (args.complexity !== undefined) result.metadata.complexity = args.complexity
+        return result
+      },
+    })
+  }
+
+  // Models only, no complexity
+  if (hasModels) {
+    const models = agent.models!
+    const modelArg = z
+      .enum(models as [string, ...string[]])
+      .optional()
+      .describe(
+        `Optional. Model id passed to the agent via '${agent.modelFlag ?? "--model"}'. ` +
+          `Allowed values: ${models.join(", ")}. ` +
           (agent.defaultModel !== undefined
             ? `Defaults to '${agent.defaultModel}' when omitted.`
             : "Omit to use the agent's built-in default."),
@@ -1319,6 +1519,22 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
     })
   }
 
+  // Complexity only, no explicit models list
+  if (complexityArg !== undefined) {
+    return tool({
+      description: describeAgent(agent),
+      args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, complexity: complexityArg },
+      execute: async (rawArgs, ctx) => {
+        const args = rawArgs as { prompt: string; includeContext?: string[]; complexity?: ComplexityTier }
+        const effectiveModel = resolveEffectiveModel(agent, { complexity: args.complexity })
+        const result = await runDelegation(agent, { prompt: args.prompt, includeContext: args.includeContext, model: effectiveModel }, makeHost(ctx))
+        if (args.complexity !== undefined) result.metadata.complexity = args.complexity
+        return result
+      },
+    })
+  }
+
+  // Neither models nor complexity — basic tool
   return tool({
     description: describeAgent(agent),
     args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG },
@@ -1327,12 +1543,217 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
 }
 
 // ============================================================================
+// Unified tool factory — single `acp_delegate` tool that routes by agent id
+// ============================================================================
+
+function describeUnifiedTool(registry: AgentConfig[], routing: RoutingTable | undefined): string {
+  const agentList = registry.map((a) => {
+    const label = a.label ?? a.id
+    const modelInfo = a.models && a.models.length > 0 ? ` (models: ${a.models.join(", ")})` : ""
+    const complexityInfo = a.complexityModels
+      ? ` (complexity: high→${a.complexityModels.high ?? "default"}, mid→${a.complexityModels.mid ?? "default"}, low→${a.complexityModels.low ?? "default"})`
+      : ""
+    return `  - "${a.id}" — ${label}${modelInfo}${complexityInfo}`
+  }).join("\n")
+
+  const routingDesc = routing && routing.length > 0
+    ? `\n\nRouting table (used when 'agent' is omitted):\n` +
+      routing.map((r) =>
+        `  ${r.complexity ?? "*"} → ${r.agent}${r.model ? ` (${r.model})` : ""}`
+      ).join("\n")
+    : "\n\nWhen 'agent' is omitted, the default agent is used."
+
+  return (
+    `Delegate a self-contained task to an external coding agent via a unified interface. ` +
+    `Select the agent by id, or omit 'agent' to let the routing table auto-select based on 'complexity'.\n\n` +
+    `Available agents:\n${agentList}${routingDesc}\n\n` +
+    `The 'model' parameter takes precedence over 'complexity'. ` +
+    `When both 'agent' and 'model' are omitted, the routing table's first entry for 'mid' (or the default tier) selects both the agent and model.\n\n` +
+    `The agent has no prior context — include all goals, constraints, and the desired output ` +
+    `format inline. It can read files within the project directory (read-only); it cannot write ` +
+    `or run shell commands. Pass relative file or directory paths via 'includeContext' to attach ` +
+    `their contents inline (capped at ${INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES / 1024} KiB total, ` +
+    `${INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES / 1024} KiB per file). Returns the agent's final text ` +
+    `response synchronously, with a [acp_delegate: …] trailer if the response was ` +
+    `truncated by the agent's own token limit.`
+  )
+}
+
+function makeUnifiedTool(registry: AgentConfig[], routing: RoutingTable | undefined): ToolDefinition {
+  const agentIds = registry.map((a) => a.id) as [string, ...string[]]
+  const agentMap = new Map(registry.map((a) => [a.id, a]))
+
+  // Determine which agents have complexityModels to decide if the complexity arg should be offered.
+  const hasAnyComplexity = registry.some((a) => a.complexityModels !== undefined)
+
+  const agentArg = z
+    .enum(agentIds)
+    .optional()
+    .describe(
+      `Optional. Agent id to delegate to. Available: ${agentIds.join(", ")}. ` +
+      `When omitted, the routing table selects the agent based on 'complexity' (defaults to 'mid').`
+    )
+
+  const modelArg = z
+    .string()
+    .optional()
+    .describe(
+      "Optional. Model id passed to the agent. Must be in the agent's 'models' list when defined. " +
+      "Takes precedence over 'complexity' when both are supplied."
+    )
+
+  const complexityArg = z
+    .enum(["high", "mid", "low"] as [string, string, string])
+    .optional()
+    .describe(
+      "Optional. Complexity tier. When 'agent' is omitted, used to look up the routing table. " +
+      "When 'agent' is supplied, maps to a model via the agent's 'complexityModels'. " +
+      "Defaults to 'mid' when both 'agent' and 'complexity' are omitted."
+    )
+
+  // Always include complexity when routing exists or any agent has complexityModels.
+  const includeComplexity = hasAnyComplexity || routing !== undefined
+
+  if (includeComplexity) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const args: any = {
+      prompt: PROMPT_ARG,
+      agent: agentArg,
+      model: modelArg,
+      complexity: complexityArg,
+      includeContext: INCLUDE_CONTEXT_ARG,
+    }
+    return tool({
+      description: describeUnifiedTool(registry, routing),
+      args,
+      execute: async (rawArgs, ctx) => {
+        const args = rawArgs as {
+          prompt: string
+          agent?: string
+          model?: string
+          complexity?: ComplexityTier
+          includeContext?: string[]
+        }
+        return executeUnifiedDelegation(agentMap, registry, routing, args, ctx)
+      },
+    })
+  }
+
+  return tool({
+    description: describeUnifiedTool(registry, routing),
+    args: {
+      prompt: PROMPT_ARG,
+      agent: agentArg,
+      model: modelArg,
+      includeContext: INCLUDE_CONTEXT_ARG,
+    },
+    execute: async (rawArgs, ctx) => {
+      const args = rawArgs as {
+        prompt: string
+        agent?: string
+        model?: string
+        includeContext?: string[]
+      }
+      return executeUnifiedDelegation(agentMap, registry, routing, args, ctx)
+    },
+  })
+}
+
+// ============================================================================
+// Unified delegation execute — shared between the two makeUnifiedTool branches
+// ============================================================================
+
+async function executeUnifiedDelegation(
+  agentMap: Map<string, AgentConfig>,
+  registry: AgentConfig[],
+  routing: RoutingTable | undefined,
+  args: { prompt: string; agent?: string; model?: string; complexity?: ComplexityTier; includeContext?: string[] },
+  ctx: {
+    sessionID?: string
+    directory: string
+    abort?: AbortSignal
+    metadata: (input: { title?: string; metadata?: Record<string, unknown> }) => void
+  },
+): Promise<{ output: string; metadata: Record<string, unknown> }> {
+  // Resolve agent: explicit > routing table > default.
+  let agent: AgentConfig
+  let routingModel: string | undefined
+
+  if (args.agent !== undefined) {
+    // Explicit agent — validate it exists.
+    const found = agentMap.get(args.agent)
+    if (found === undefined) {
+      const available = Array.from(agentMap.keys()).join(", ")
+      return {
+        output: `acp_delegate failed: unknown agent '${args.agent}'. Available: ${available}`,
+        metadata: {
+          agentId: args.agent,
+          durationMs: 0,
+          status: "error" as DelegationStatus,
+          errorCode: "EAGENT",
+        },
+      }
+    }
+    agent = found
+  } else {
+    // No explicit agent — resolve via routing table or default.
+    const route = resolveRoute(routing, registry, args.complexity)
+    agent = route.agent
+    routingModel = route.model
+  }
+
+  // Resolve effective model.
+  // Precedence: explicit model > routing table model > complexityModels[tier] > defaultModel.
+  let effectiveModel: string | undefined
+  if (args.model !== undefined) {
+    effectiveModel = args.model
+  } else if (routingModel !== undefined) {
+    effectiveModel = routingModel
+  } else {
+    effectiveModel = resolveEffectiveModel(agent, { complexity: args.complexity })
+  }
+
+  // Validate effective model against agent.models when defined.
+  if (effectiveModel !== undefined && agent.models !== undefined && agent.models.length > 0) {
+    if (!agent.models.includes(effectiveModel)) {
+      return {
+        output: `acp_delegate failed: model '${effectiveModel}' is not in agent '${agent.id}' models [${agent.models.join(", ")}]`,
+        metadata: {
+          agentId: agent.id,
+          durationMs: 0,
+          status: "error" as DelegationStatus,
+          errorCode: "EMODEL",
+        },
+      }
+    }
+  }
+
+  // Delegate to runDelegation with the resolved model.
+  const result = await runDelegation(agent, {
+    prompt: args.prompt,
+    includeContext: args.includeContext,
+    model: effectiveModel,
+  }, ctx, "acp_delegate")
+
+  // Inject routing metadata.
+  result.metadata.agentId = agent.id
+  if (args.complexity !== undefined) {
+    result.metadata.complexity = args.complexity
+  } else if (args.agent === undefined) {
+    // When agent was auto-selected, echo the effective complexity tier.
+    result.metadata.complexity = args.complexity ?? "mid"
+  }
+
+  return result
+}
+
+// ============================================================================
 // Plugin entry point
 // ============================================================================
 
 const plugin: Plugin = async (_input: PluginInput, options?: OpencodePluginOptions) => {
   const config = (options ?? {}) as unknown as AcpPluginOptions
-  const { agents: registry, injectSystemGuidance } = resolvePluginOptions(config)
+  const { agents: registry, injectSystemGuidance, enableUnifiedTool, routing } = resolvePluginOptions(config)
 
   // Fire-and-forget startup health probe; never blocks plugin load.
   void probeAll(registry)
@@ -1345,11 +1766,31 @@ const plugin: Plugin = async (_input: PluginInput, options?: OpencodePluginOptio
     tools[name] = makeDelegateTool(agent)
   }
 
+  // Register the unified acp_delegate tool when opted in.
+  if (enableUnifiedTool) {
+    tools["acp_delegate"] = makeUnifiedTool(registry, routing)
+  }
+
   // Optional system-prompt routing block. Off by default — opt in via
   // `injectSystemGuidance: true` in the JSON fallback config.
   const result: Awaited<ReturnType<Plugin>> = { tool: tools }
   if (injectSystemGuidance) {
-    const block = buildRoutingBlock(registry)
+    let block = buildRoutingBlock(registry)
+    if (enableUnifiedTool) {
+      // Append unified tool entry to the routing block.
+      const routingDesc = routing && routing.length > 0
+        ? `Routing: ${routing.map((r) => `${r.complexity ?? "*"}→${r.agent}${r.model ? `(${r.model})` : ""}`).join(", ")}.`
+        : "When 'agent' is omitted, the default agent is used."
+      const unifiedEntry =
+        `\n- \`acp_delegate\` — Unified delegation tool. Pass \`agent\` to select the target ` +
+        `(or omit to auto-route via complexity). Pass \`complexity\` (high|mid|low) to select ` +
+        `the right model. ${routingDesc} ` +
+        `Use when you don't want to think about which delegate_to_<id> tool to call.`
+      block = block.replace(
+        "</acp-delegate-routing>",
+        unifiedEntry + "\n</acp-delegate-routing>"
+      )
+    }
     ;(result as Record<string, unknown>)["experimental.chat.system.transform"] = async (
       _input2: unknown,
       output: { system: string[] },
