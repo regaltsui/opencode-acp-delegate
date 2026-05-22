@@ -28,6 +28,38 @@
  * SOURCE: https://github.com/regaltsui/opencode-acp-delegate
  */
 
+// ---------------------------------------------------------------------------
+// Portable crypto utilities (Web Crypto API — works in Node, Deno, Bun)
+// Avoids `node:crypto` which may not resolve in non-Node plugin runtimes.
+// ---------------------------------------------------------------------------
+
+/** Generate a UUID v4 using globalThis.crypto (with manual fallback). */
+function randomUUID(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID()
+  }
+  // Fallback: UUID v4 from getRandomValues
+  const buf = new Uint8Array(16)
+  globalThis.crypto.getRandomValues(buf)
+  buf[6] = (buf[6] & 0x0f) | 0x40 // version 4
+  buf[8] = (buf[8] & 0x3f) | 0x80 // variant 10
+  const hex = Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+/** Generate `bytes` random bytes as a hex string (replaces `randomBytes(n).toString("hex")`). */
+function randomHex(bytes: number): string {
+  const buf = new Uint8Array(bytes)
+  globalThis.crypto.getRandomValues(buf)
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("")
+}
+
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process"
+import { existsSync, readFileSync } from "node:fs"
+import { readFile, writeFile, mkdir, stat, unlink, rename, appendFile } from "node:fs/promises"
+import { createInterface } from "node:readline"
+import { join, dirname, relative, isAbsolute, resolve as resolvePath } from "node:path"
+import { homedir } from "node:os"
 import {
   type Plugin,
   type PluginInput,
@@ -40,7 +72,6 @@ import {
   type AgentConfig,
   type AcpPluginOptions,
   type HealthEntry,
-  type HostAdapter,
   OPENCODE_NAMESPACE,
   INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES,
   INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES,
@@ -452,7 +483,7 @@ async function saveStateAtomic(state: AcpState): Promise<void> {
   const dir = dirname(target)
   const tmpPath = join(
     dir,
-    `${STATE_FILE_NAME}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`,
+    `${STATE_FILE_NAME}.${process.pid}.${randomHex(4)}.tmp`,
   )
   const payload = { ...state, version: STATE_FILE_VERSION, updatedAt: Date.now(), pid: process.pid }
   try {
@@ -1307,7 +1338,7 @@ async function runDelegation(
     sessionID?: string
     directory: string
     abort?: AbortSignal
-    metadata: (input: { title?: string; metadata?: Record<string, unknown> }) => void
+    metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void
   },
   toolPrefix?: string,
 ): Promise<{ output: string; metadata: Record<string, unknown> }> {
@@ -1317,7 +1348,7 @@ async function runDelegation(
   const sessionIdShort = String(ctx.sessionID ?? "").slice(0, 6)
   const promptSnippet = snippet(args.prompt, PROMPT_SNIPPET_MAX)
 
-  ctx.metadata({ title: `[${agent.id}] ${snippet(args.prompt, TITLE_PROMPT_MAX)}` })
+  ctx.metadata?.({ title: `[${agent.id}] ${snippet(args.prompt, TITLE_PROMPT_MAX)}` })
 
   void recordInflight({
     callId,
@@ -1515,7 +1546,7 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
     return tool({
       description: describeAgent(agent),
       args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, model: modelArg },
-      execute: async (args, ctx) => runDelegation(agent, args, makeHost(ctx)),
+      execute: async (args, ctx) => runDelegation(agent, args, ctx),
     })
   }
 
@@ -1538,7 +1569,7 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
   return tool({
     description: describeAgent(agent),
     args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG },
-    execute: async (args, ctx) => runDelegation(agent, args, makeHost(ctx)),
+    execute: async (args, ctx) => runDelegation(agent, args, ctx),
   })
 }
 
