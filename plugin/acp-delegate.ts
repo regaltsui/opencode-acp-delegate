@@ -1,31 +1,19 @@
 /**
  * opencode-acp-delegate — ACP delegation plugin for Opencode
  *
- * Registers one tool per configured ACP agent: `delegate_to_<id>`. Each tool
- * drives a one-shot ACP session via @regaltsui/acp-delegate shared core and
- * returns the agent's final text response synchronously.
+ * Exposes a single unified `acp_delegate` tool that routes to any configured
+ * ACP agent by id via the shared core @regaltsui/acp-delegate. Each agent
+ * drives a one-shot ACP session and returns the final text response synchronously.
+ *
+ * Legacy mode (enableUnifiedTool: false) keeps per-agent delegate_to_<id> tools
+ * for backward compatibility. When enableUnifiedTool: true, only acp_delegate
+ * is exposed as the sole entry point.
  *
  * CONFIGURATION: Provide agents via JSON or as tuple options in opencode.json:
  *   1. Tuple options (GitHub URL install in opencode.json)
  *   2. $OPENCODE_ACP_DELEGATE_CONFIG (path to a JSON file)
  *   3. ~/.config/opencode/acp-delegate.json
  *   4. ~/.opencode/acp-delegate.json
- *
- * Example JSON:
- *   {
- *     "agents": [
- *       { "id": "gemini",   "command": ["gemini", "--acp"] },
- *       { "id": "opencode", "command": ["opencode", "acp"] },
- *       { "id": "claude",   "command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@latest"] }
- *     ]
- *   }
- *
- * STATE & TELEMETRY: lifecycle events are persisted to
- *   $XDG_STATE_HOME/opencode/acp-delegate/state.json (inflight + recent + health)
- *   $XDG_STATE_HOME/opencode/acp-delegate/usage.jsonl (per-call audit, rotates at 5 MiB)
- * Health probes fire once at plugin load (best-effort, non-blocking).
- *
- * SOURCE: https://github.com/regaltsui/opencode-acp-delegate
  */
 
 // ---------------------------------------------------------------------------
@@ -69,64 +57,89 @@ import {
   tool,
 } from "@opencode-ai/plugin"
 import {
-  type AgentConfig,
-  type AcpPluginOptions,
+  // Types
+  type AgentConfig as CoreAgentConfig,
+  type AcpPluginOptions as CoreAcpPluginOptions,
   type HealthEntry,
+  type AcpStopReason,
+  type DelegationStatus,
+  type AcpClientOptions,
+  type OneShotResult,
+  type InflightEntry,
+  type RecentEntry,
+  type AcpState,
+  type UsageEntry,
+  type PreambleBlock,
+  type ExecuteOutcome,
+  type HostAdapter,
+  type Namespace,
+  type ComplexityTier,
+  type RunDelegationArgs,
+  // Constants
   OPENCODE_NAMESPACE,
   INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES,
   INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES,
+  INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES as INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES_CORE,
+  INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES as INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES_CORE,
+  DEFAULT_TIMEOUT_MS,
+  GRACE_PERIOD_MS,
+  MAX_OUTPUT_BYTES,
+  STDERR_BUFFER_BYTES,
+  ACP_PROTOCOL_VERSION,
+  SESSION_CLOSE_TIMEOUT_MS,
+  HEALTH_PROBE_TIMEOUT_MS,
+  STATE_RECENT_MAX,
+  STATE_FILE_VERSION,
+  USAGE_LOG_MAX_BYTES,
+  PROMPT_SNIPPET_MAX,
+  TITLE_PROMPT_MAX,
+  COMPLEXITY_TIERS,
+  STATE_FILE_NAME,
+  USAGE_LOG_NAME,
+  // Functions — config
   readFallbackConfig,
   validateAgent,
   missingAgentsMessage,
-  probeAll,
+  // Functions — state (namespace-parameterized)
+  recordInflight as coreRecordInflight,
+  resolveInflight as coreResolveInflight,
   recordHealth,
+  appendUsage as coreAppendUsage,
+  getStateDir as coreGetStateDir,
+  // Functions — context
+  buildContextPreamble,
+  snippet,
+  // Functions — descriptions / routing
   sanitizeToolSuffix,
   describeAgent,
+  describeAgentFooter,
+  summarizeAgent,
   buildRoutingBlock,
-  runDelegation,
+  buildSpawnCommand,
+  resolveModel,
+  // Functions — health
+  probeAll,
+  // Functions — delegation
+  runDelegation as coreRunDelegation,
+  // Functions — trailer
+  applyStopReasonTrailer,
+  // Functions — errors
+  AcpError,
+  AcpTimeoutError,
+  AcpAbortError,
 } from "@regaltsui/acp-delegate"
 
 const z = tool.schema
 
 // ============================================================================
-// Config resolution — tuple options first, JSON file fallback
+// Plugin-specific extensions to core types
 // ============================================================================
 
-const DEFAULT_TIMEOUT_MS = 600_000
-const GRACE_PERIOD_MS = 5_000
-const MAX_OUTPUT_BYTES = 8 * 1024 * 1024
-const STDERR_BUFFER_BYTES = 64 * 1024
-const ACP_PROTOCOL_VERSION = 1
-const SESSION_CLOSE_TIMEOUT_MS = 1_000
-const HEALTH_PROBE_TIMEOUT_MS = 5_000
-const STATE_RECENT_MAX = 20
-const STATE_FILE_VERSION = 1
-const INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES = 64 * 1024
-const INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES = 256 * 1024
-const USAGE_LOG_MAX_BYTES = 5 * 1024 * 1024
-const PROMPT_SNIPPET_MAX = 80
-const TITLE_PROMPT_MAX = 60
-
-// ============================================================================
-// Types
-// ============================================================================
-
-interface AgentConfig {
-  id: string
-  command: string[]
-  default?: boolean
-  timeout?: number
-  label?: string
-  description?: string
-  whenToUse?: string
-  models?: string[]
-  defaultModel?: string
-  complexityModels?: { high?: string; mid?: string; low?: string }
-  modelFlag?: string
-  autoApprove?: boolean
+/** Extended config type — adds routing and unified-tool support on top of core. */
+interface AcpPluginOptions extends CoreAcpPluginOptions {
+  routing?: RoutingTable
+  enableUnifiedTool?: boolean
 }
-
-type ComplexityTier = "high" | "mid" | "low"
 
 interface RoutingEntry {
   /** Agent id — must exist in the agents array. */
@@ -139,103 +152,23 @@ interface RoutingEntry {
 
 type RoutingTable = RoutingEntry[]
 
-interface AcpPluginOptions {
-  agents: AgentConfig[]
-  injectSystemGuidance?: boolean
-  enableUnifiedTool?: boolean
-  routing?: RoutingTable
-}
-
-type AcpStopReason =
-  | "end_turn"
-  | "max_tokens"
-  | "max_turn_requests"
-  | "refusal"
-  | "cancelled"
-
-type DelegationStatus = "complete" | "error" | "cancelled"
-
-interface AcpClientOptions {
-  command: string[]
-  cwd: string
-  timeout: number
-  signal?: AbortSignal
-  autoApprove: boolean
-}
-
-interface OneShotResult {
-  output: string
-  metadata: {
-    durationMs: number
-    agentId: string
-    stopReason?: AcpStopReason
-  }
-}
-
-interface InflightEntry {
-  callId: string
-  sessionId: string
-  agentId: string
-  promptSnippet: string
-  startedAt: number
-}
-
-interface RecentEntry extends InflightEntry {
-  status: DelegationStatus
-  endedAt: number
-  durationMs: number
-  errorCode?: string
-}
-
-interface HealthEntry {
-  agentId: string
-  ok: boolean
-  durationMs: number
-  checkedAt: number
-  error?: string
-}
-
-interface AcpState {
-  version: 1
-  updatedAt: number
-  pid: number
-  inflight: InflightEntry[]
-  recent: RecentEntry[]
-  health: HealthEntry[]
-}
-
-interface UsageEntry {
-  ts: number
-  callId: string
-  sessionId: string
-  agentId: string
-  status: DelegationStatus
-  durationMs: number
-  promptBytes: number
-  outputBytes: number
-  errorCode?: string
-  stopReason?: string
-}
-
 // ============================================================================
 // Agent registry — JSON fallback config (drop-in path can't receive tuple opts)
 // ============================================================================
 
-const MISSING_AGENTS_MESSAGE =
-  'Plugin options must include a non-empty \'agents\' array, or set OPENCODE_ACP_DELEGATE_CONFIG / drop a JSON file at ~/.config/opencode/acp-delegate.json. Example: { "agents": [{ "id": "gemini", "command": ["gemini", "--acp"] }] }'
-
-const CONFIG_ENV_VAR = "OPENCODE_ACP_DELEGATE_CONFIG"
+const CONFIG_ENV_VAR = `${OPENCODE_NAMESPACE.envPrefix}_CONFIG`
 
 function fallbackConfigPaths(): string[] {
   const paths: string[] = []
   const fromEnv = process.env[CONFIG_ENV_VAR]
   if (fromEnv && fromEnv.length > 0) paths.push(fromEnv)
-  paths.push(join(homedir(), ".config", "opencode", "acp-delegate.json"))
-  paths.push(join(homedir(), ".opencode", "acp-delegate.json"))
+  const dir = OPENCODE_NAMESPACE.configDirSubpath
+  paths.push(join(homedir(), ".config", dir, "acp-delegate.json"))
+  paths.push(join(homedir(), `.${dir}`, "acp-delegate.json"))
   return paths
 }
 
-function readFallbackConfig(): AcpPluginOptions | null {
+function readFallbackConfigLocal(): CoreAcpPluginOptions | null {
   for (const p of fallbackConfigPaths()) {
     if (!existsSync(p)) continue
     try {
@@ -251,109 +184,12 @@ function readFallbackConfig(): AcpPluginOptions | null {
   return null
 }
 
-function validateAgent(raw: unknown, index: number): AgentConfig {
-  if (raw === null || typeof raw !== "object") {
-    throw new Error(
-      `Agent config at index ${index} is invalid: expected object, got ${raw === null ? "null" : typeof raw}`,
-    )
-  }
-  const candidate = raw as Partial<AgentConfig>
-  if (typeof candidate.id !== "string" || candidate.id.length === 0) {
-    throw new Error(`Agent config at index ${index} is invalid: 'id' must be a non-empty string`)
-  }
-  if (!Array.isArray(candidate.command) || candidate.command.length === 0) {
-    throw new Error(`Agent config at index ${index} is invalid: 'command' must be a non-empty string array`)
-  }
-  for (let j = 0; j < candidate.command.length; j++) {
-    if (typeof candidate.command[j] !== "string") {
-      throw new Error(`Agent config at index ${index} is invalid: command[${j}] must be a string`)
-    }
-  }
-  if (candidate.label !== undefined && typeof candidate.label !== "string") {
-    throw new Error(`Agent config at index ${index} is invalid: 'label' must be a string when provided`)
-  }
-  if (candidate.description !== undefined && typeof candidate.description !== "string") {
-    throw new Error(`Agent config at index ${index} is invalid: 'description' must be a string when provided`)
-  }
-  if (candidate.whenToUse !== undefined && typeof candidate.whenToUse !== "string") {
-    throw new Error(`Agent config at index ${index} is invalid: 'whenToUse' must be a string when provided`)
-  }
-  if (candidate.modelFlag !== undefined) {
-    if (typeof candidate.modelFlag !== "string" || candidate.modelFlag.length === 0) {
-      throw new Error(`Agent config at index ${index} is invalid: 'modelFlag' must be a non-empty string when provided`)
-    }
-  }
-  if (candidate.models !== undefined) {
-    if (!Array.isArray(candidate.models) || candidate.models.length === 0) {
-      throw new Error(`Agent config at index ${index} is invalid: 'models' must be a non-empty string array when provided`)
-    }
-    for (let j = 0; j < candidate.models.length; j++) {
-      const m = candidate.models[j]
-      if (typeof m !== "string" || m.length === 0) {
-        throw new Error(`Agent config at index ${index} is invalid: models[${j}] must be a non-empty string`)
-      }
-    }
-    const seen = new Set<string>()
-    for (const m of candidate.models) {
-      if (seen.has(m)) {
-        throw new Error(`Agent config at index ${index} is invalid: models contains duplicate '${m}'`)
-      }
-      seen.add(m)
-    }
-  }
-  if (candidate.defaultModel !== undefined) {
-    if (typeof candidate.defaultModel !== "string" || candidate.defaultModel.length === 0) {
-      throw new Error(`Agent config at index ${index} is invalid: 'defaultModel' must be a non-empty string when provided`)
-    }
-    if (Array.isArray(candidate.models) && candidate.models.length > 0) {
-      if (!candidate.models.includes(candidate.defaultModel)) {
-        throw new Error(
-          `Agent config at index ${index} is invalid: defaultModel '${candidate.defaultModel}' is not in models [${candidate.models.join(", ")}]`,
-        )
-      }
-    }
-  }
-  if (candidate.complexityModels !== undefined) {
-    if (typeof candidate.complexityModels !== "object" || candidate.complexityModels === null || Array.isArray(candidate.complexityModels)) {
-      throw new Error(`Agent config at index ${index} is invalid: 'complexityModels' must be an object when provided`)
-    }
-    const validTiers = new Set<string>(["high", "mid", "low"])
-    for (const key of Object.keys(candidate.complexityModels)) {
-      if (!validTiers.has(key)) {
-        throw new Error(`Agent config at index ${index} is invalid: complexityModels has unknown key '${key}' (allowed: high, mid, low)`)
-      }
-      const val = (candidate.complexityModels as Record<string, unknown>)[key]
-      if (val !== undefined) {
-        if (typeof val !== "string" || val.length === 0) {
-          throw new Error(`Agent config at index ${index} is invalid: complexityModels.${key} must be a non-empty string when provided`)
-        }
-        if (Array.isArray(candidate.models) && candidate.models.length > 0 && !candidate.models.includes(val as string)) {
-          throw new Error(`Agent config at index ${index} is invalid: complexityModels.${key} '${val}' is not in models [${candidate.models.join(", ")}]`)
-        }
-      }
-    }
-  }
-  if (candidate.autoApprove !== undefined && typeof candidate.autoApprove !== "boolean") {
-    throw new Error(`Agent config at index ${index} is invalid: 'autoApprove' must be a boolean when provided`)
-  }
-  return {
-    id: candidate.id,
-    command: candidate.command as string[],
-    default: candidate.default,
-    timeout: candidate.timeout ?? DEFAULT_TIMEOUT_MS,
-    autoApprove: candidate.autoApprove ?? true,
-    ...(candidate.label !== undefined ? { label: candidate.label } : {}),
-    ...(candidate.description !== undefined ? { description: candidate.description } : {}),
-    ...(candidate.whenToUse !== undefined ? { whenToUse: candidate.whenToUse } : {}),
-    ...(candidate.models !== undefined ? { models: [...candidate.models] } : {}),
-    ...(candidate.defaultModel !== undefined ? { defaultModel: candidate.defaultModel } : {}),
-    ...(candidate.complexityModels !== undefined ? { complexityModels: { ...candidate.complexityModels } } : {}),
-    ...(candidate.modelFlag !== undefined ? { modelFlag: candidate.modelFlag } : {}),
-  }
-}
+// ============================================================================
+// Plugin-specific config resolver (routing + unified tool on top of core)
+// ============================================================================
 
 function resolvePluginOptions(opts: AcpPluginOptions): {
-  agents: AgentConfig[]
+  agents: CoreAgentConfig[]
   injectSystemGuidance: boolean
   enableUnifiedTool: boolean
   routing: RoutingTable | undefined
@@ -361,7 +197,7 @@ function resolvePluginOptions(opts: AcpPluginOptions): {
   let source: AcpPluginOptions | null =
     opts && Array.isArray(opts.agents) && opts.agents.length > 0 ? opts : null
   if (!source) {
-    source = readFallbackConfig(OPENCODE_NAMESPACE)
+    source = readFallbackConfigLocal()
   }
   if (!source || !Array.isArray(source.agents) || source.agents.length === 0) {
     throw new Error(missingAgentsMessage(OPENCODE_NAMESPACE))
@@ -422,19 +258,16 @@ function validateRouting(routing: RoutingTable | undefined, agents: unknown[]): 
 }
 
 // ============================================================================
-// Tool arg schemas
+// State directory — opencode-specific path resolution
 // ============================================================================
 
-const STATE_DIR_ENV = "OPENCODE_ACP_DELEGATE_STATE_DIR"
-const STATE_FILE_NAME = "state.json"
-const USAGE_LOG_NAME = "usage.jsonl"
+const STATE_DIR_ENV = `${OPENCODE_NAMESPACE.envPrefix}_STATE_DIR`
 
+/** Opencode-specific state dir resolver; delegates to core when no explicit override. */
 function getStateDir(): string {
   const explicit = process.env[STATE_DIR_ENV]
   if (explicit && explicit.length > 0) return explicit
-  const xdg = process.env["XDG_STATE_HOME"]
-  if (xdg && xdg.length > 0) return join(xdg, "opencode", "acp-delegate")
-  return join(homedir(), ".local", "state", "opencode", "acp-delegate")
+  return coreGetStateDir(OPENCODE_NAMESPACE)
 }
 
 function getStateFilePath(): string {
@@ -502,7 +335,10 @@ function enqueue<T>(fn: () => Promise<T>): Promise<T> {
   return next
 }
 
-async function recordInflight(entry: InflightEntry): Promise<void> {
+// State mutations — wrapper functions that supply OPENCODE_NAMESPACE to core.
+// The core versions accept a Namespace first parameter; these wrappers fix it.
+
+async function localRecordInflight(entry: InflightEntry): Promise<void> {
   return enqueue(async () => {
     const state = await loadState()
     state.inflight = state.inflight.filter((e) => e.callId !== entry.callId)
@@ -511,7 +347,7 @@ async function recordInflight(entry: InflightEntry): Promise<void> {
   })
 }
 
-async function resolveInflight(
+async function localResolveInflight(
   callId: string,
   result: { status: DelegationStatus; endedAt: number; durationMs: number; errorCode?: string },
 ): Promise<void> {
@@ -551,7 +387,7 @@ async function rotateUsageLogIfNeeded(target: string): Promise<void> {
   } catch {}
 }
 
-async function appendUsage(entry: UsageEntry): Promise<void> {
+async function localAppendUsage(entry: UsageEntry): Promise<void> {
   return enqueue(async () => {
     await ensureStateDir()
     const target = getUsageLogPath()
@@ -563,44 +399,6 @@ async function appendUsage(entry: UsageEntry): Promise<void> {
 // ============================================================================
 // Inline ACP client — raw JSON-RPC 2.0 over stdio (no SDK dependency)
 // ============================================================================
-
-class AcpError extends Error {
-  readonly code?: string
-  readonly stderr?: string
-  constructor(message: string, code?: string, stderr?: string) {
-    super(message)
-    this.name = "AcpError"
-    this.code = code
-    this.stderr = stderr
-  }
-}
-
-class AcpTimeoutError extends AcpError {
-  readonly agentId: string
-  readonly timeoutMs: number
-  constructor(agentId: string, timeoutMs: number, stderr?: string) {
-    super(`Agent ${agentId} timed out after ${timeoutMs}ms`, "ETIMEDOUT", stderr)
-    this.name = "AcpTimeoutError"
-    this.agentId = agentId
-    this.timeoutMs = timeoutMs
-  }
-}
-
-class AcpAbortError extends AcpError {
-  constructor(stderr?: string) {
-    super("Delegation aborted", "ECANCELLED", stderr)
-    this.name = "AcpAbortError"
-  }
-}
-
-interface JsonRpcMessage {
-  jsonrpc?: string
-  id?: number | string
-  method?: string
-  params?: unknown
-  result?: unknown
-  error?: { code?: number; message?: string }
-}
 
 interface SessionUpdateParams {
   sessionId?: string
@@ -806,9 +604,9 @@ async function runOneShotSession(opts: AcpClientOptions, prompt: string): Promis
   rl.on("line", (rawLine: string) => {
     const trimmed = rawLine.trim()
     if (trimmed.length === 0) return
-    let msg: JsonRpcMessage
+    let msg: { jsonrpc?: string; id?: number | string; method?: string; params?: unknown; result?: unknown; error?: { code?: number; message?: string } }
     try {
-      msg = JSON.parse(trimmed) as JsonRpcMessage
+      msg = JSON.parse(trimmed)
     } catch {
       return
     }
@@ -969,304 +767,17 @@ async function runOneShotSession(opts: AcpClientOptions, prompt: string): Promis
 }
 
 // ============================================================================
-// Health probe — fired (not awaited) at plugin load
-// ============================================================================
-
-async function probeAgent(agent: AgentConfig): Promise<HealthEntry> {
-  const startMs = Date.now()
-  const binary = agent.command[0]
-  if (!binary) {
-    return {
-      agentId: agent.id,
-      ok: false,
-      durationMs: 0,
-      checkedAt: Date.now(),
-      error: "command must have at least one element",
-    }
-  }
-  let child: ChildProcessWithoutNullStreams
-  try {
-    child = spawn(binary, agent.command.slice(1), { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] })
-  } catch (e) {
-    const err = e as NodeJS.ErrnoException
-    return {
-      agentId: agent.id,
-      ok: false,
-      durationMs: Date.now() - startMs,
-      checkedAt: Date.now(),
-      error: err.code === "ENOENT" ? `Agent binary not found: ${binary}` : err.message,
-    }
-  }
-  child.stderr.on("data", () => {})
-  child.on("error", () => {})
-
-  let nextId = 0
-  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>()
-  const rl = createInterface({ input: child.stdout })
-  rl.on("line", (line: string) => {
-    if (!line.trim()) return
-    try {
-      const m = JSON.parse(line.trim()) as JsonRpcMessage
-      if (typeof m.id === "number" && pending.has(m.id)) {
-        const handler = pending.get(m.id)!
-        pending.delete(m.id)
-        if (m.error) handler.reject(new Error(m.error.message ?? "agent error"))
-        else handler.resolve(m.result)
-      }
-    } catch {}
-  })
-
-  const send = (method: string, params: unknown): Promise<unknown> => {
-    const id = ++nextId
-    return new Promise((res, rej) => {
-      pending.set(id, { resolve: res, reject: rej })
-      try { child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n") } catch (e) {
-        pending.delete(id)
-        rej(e)
-      }
-    })
-  }
-
-  const timeoutPromise = new Promise<never>((_, rej) =>
-    setTimeout(() => rej(new Error(`Probe timed out after ${HEALTH_PROBE_TIMEOUT_MS}ms`)), HEALTH_PROBE_TIMEOUT_MS).unref(),
-  )
-
-  try {
-    await Promise.race([
-      send("initialize", { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} }),
-      timeoutPromise,
-    ])
-    return {
-      agentId: agent.id,
-      ok: true,
-      durationMs: Date.now() - startMs,
-      checkedAt: Date.now(),
-    }
-  } catch (e) {
-    return {
-      agentId: agent.id,
-      ok: false,
-      durationMs: Date.now() - startMs,
-      checkedAt: Date.now(),
-      error: (e as Error).message ?? String(e),
-    }
-  } finally {
-    rl.close()
-    try { if (!child.killed) child.kill("SIGTERM") } catch {}
-    setTimeout(() => { try { if (!child.killed) child.kill("SIGKILL") } catch {} }, 1_000).unref()
-  }
-}
-
-async function probeAll(registry: AgentConfig[]): Promise<HealthEntry[]> {
-  if (registry.length === 0) return []
-  return Promise.all(registry.map((agent) => probeAgent(agent)))
-}
-
-// ============================================================================
-// includeContext — eager bounded preamble
-// ============================================================================
-
-interface PreambleBlock {
-  path: string
-  status: "ok" | "skipped"
-  reason?: string
-  content?: string
-  bytes: number
-  truncated: boolean
-}
-
-function looksBinary(buf: Buffer): boolean {
-  const limit = Math.min(buf.length, 8192)
-  for (let i = 0; i < limit; i++) if (buf[i] === 0) return true
-  return false
-}
-
-async function expandSinglePath(
-  cwdAbs: string,
-  rel: string,
-  remainingBudget: number,
-): Promise<PreambleBlock[]> {
-  const requested = isAbsolute(rel) ? rel : resolvePath(cwdAbs, rel)
-  const target = resolvePath(requested)
-  if (target !== cwdAbs && !isPathInside(target, cwdAbs)) {
-    return [{ path: rel, status: "skipped", reason: "outside project directory", bytes: 0, truncated: false }]
-  }
-  let info
-  try {
-    info = await stat(target)
-  } catch (e) {
-    const err = e as NodeJS.ErrnoException
-    return [{ path: rel, status: "skipped", reason: err.code ?? err.message, bytes: 0, truncated: false }]
-  }
-  if (info.isDirectory()) {
-    const { readdir } = await import("node:fs/promises")
-    let entries: string[]
-    try {
-      entries = await readdir(target)
-    } catch (e) {
-      const err = e as NodeJS.ErrnoException
-      return [{ path: rel, status: "skipped", reason: err.code ?? err.message, bytes: 0, truncated: false }]
-    }
-    entries.sort()
-    const blocks: PreambleBlock[] = []
-    let budget = remainingBudget
-    for (const entry of entries) {
-      if (budget <= 0) {
-        blocks.push({ path: `${rel}/${entry}`, status: "skipped", reason: "total budget exhausted", bytes: 0, truncated: false })
-        continue
-      }
-      const childBlocks = await expandSinglePath(cwdAbs, `${rel}/${entry}`, budget)
-      for (const b of childBlocks) {
-        blocks.push(b)
-        budget -= b.bytes
-      }
-    }
-    return blocks
-  }
-  if (!info.isFile()) {
-    return [{ path: rel, status: "skipped", reason: "not a regular file", bytes: 0, truncated: false }]
-  }
-  if (remainingBudget <= 0) {
-    return [{ path: rel, status: "skipped", reason: "total budget exhausted", bytes: 0, truncated: false }]
-  }
-  let raw: Buffer
-  try {
-    raw = await readFile(target)
-  } catch (e) {
-    const err = e as NodeJS.ErrnoException
-    return [{ path: rel, status: "skipped", reason: err.code ?? err.message, bytes: 0, truncated: false }]
-  }
-  if (looksBinary(raw)) {
-    return [{ path: rel, status: "skipped", reason: "binary file", bytes: 0, truncated: false }]
-  }
-  const perFileCap = Math.min(INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES, remainingBudget)
-  const truncated = raw.length > perFileCap
-  const sliced = truncated ? raw.subarray(0, perFileCap) : raw
-  return [{ path: rel, status: "ok", content: sliced.toString("utf8"), bytes: sliced.length, truncated }]
-}
-
-async function buildContextPreamble(cwd: string, paths: string[]): Promise<string> {
-  if (paths.length === 0) return ""
-  const cwdAbs = resolvePath(cwd)
-  const blocks: PreambleBlock[] = []
-  let totalBudget = INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES
-  for (const p of paths) {
-    if (totalBudget <= 0) {
-      blocks.push({ path: p, status: "skipped", reason: "total budget exhausted", bytes: 0, truncated: false })
-      continue
-    }
-    const expanded = await expandSinglePath(cwdAbs, p, totalBudget)
-    for (const b of expanded) {
-      blocks.push(b)
-      totalBudget -= b.bytes
-    }
-  }
-  const parts: string[] = []
-  for (const b of blocks) {
-    if (b.status === "ok" && b.content !== undefined) {
-      const trunc = b.truncated ? ' truncated="true"' : ""
-      parts.push(`<context path="${b.path}"${trunc}>\n${b.content}\n</context>`)
-    } else {
-      parts.push(`<context path="${b.path}" skipped="true" reason="${b.reason ?? "unknown"}"/>`)
-    }
-  }
-  return parts.join("\n") + "\n\n"
-}
-
-// ============================================================================
 // Plugin entry — one tool per registered agent + state-file integration
 // ============================================================================
 
-function sanitizeToolSuffix(id: string): string {
-  return id.replace(/[^a-zA-Z0-9_]/g, "_")
-}
-
-function describeAgentFooter(agent: AgentConfig): string {
-  return (
-    `\n\nThe agent has no prior context — include all goals, constraints, and the desired output ` +
-    `format inline. It can read files within the project directory (read-only); it cannot write ` +
-    `or run shell commands. Pass relative file or directory paths via 'includeContext' to attach ` +
-    `their contents inline (capped at ${INCLUDE_CONTEXT_TOTAL_BUDGET_BYTES / 1024} KiB total, ` +
-    `${INCLUDE_CONTEXT_PER_FILE_BUDGET_BYTES / 1024} KiB per file). Returns the agent's final text ` +
-    `response synchronously, with a [delegate_to_${agent.id}: …] trailer if the response was ` +
-    `truncated by the agent's own token limit.`
-  )
-}
-
-function describeAgent(agent: AgentConfig): string {
-  if (agent.description !== undefined && agent.description.length > 0) {
-    return agent.description + describeAgentFooter(agent)
-  }
-  const label = agent.label ?? agent.id
-  return (
-    `Delegate a self-contained task to the '${label}' coding agent (separate process, fresh session). ` +
-    `Useful when you want a second opinion from a different model family, when offloading bulk read-only ` +
-    `analysis across many files, or when fanning out 3+ independent subtasks in parallel.` +
-    describeAgentFooter(agent)
-  )
-}
-
-function summarizeAgent(agent: AgentConfig): string {
-  if (agent.whenToUse !== undefined && agent.whenToUse.length > 0) return agent.whenToUse
-  if (agent.description !== undefined && agent.description.length > 0) {
-    const firstSentence = agent.description.split(/(?<=[.!?])\s+/, 1)[0] ?? agent.description
-    return firstSentence
-  }
-  const label = agent.label ?? agent.id
-  return `Delegate to '${label}' for a second opinion or bulk read-only analysis.`
-}
-
-function buildRoutingBlock(registry: AgentConfig[]): string {
-  const lines = registry.map((a) => {
-    const toolName = `delegate_to_${sanitizeToolSuffix(a.id)}`
-    return `- \`${toolName}\` — ${summarizeAgent(a)}`
-  })
-  return (
-    `<acp-delegate-routing>\n` +
-    `You can delegate self-contained tasks to one of these external coding agents:\n\n` +
-    lines.join("\n") +
-    `\n\nEach call spawns a fresh subprocess — the prompt must be self-contained, no session memory. ` +
-    `Pass file/directory paths via \`includeContext\` to attach contents inline. Reach for delegation ` +
-    `when offloading bulk read-only analysis (5+ files), getting an independent second opinion, or ` +
-    `fanning out 3+ subtasks in parallel.\n\n` +
-    `Skip when: simple grep/search, single-file edits with exact path, multi-turn chains.\n` +
-    `</acp-delegate-routing>`
-  )
-}
-
-function buildSpawnCommand(agent: AgentConfig, requestedModel: string | undefined): string[] {
-  const chosen = requestedModel ?? agent.defaultModel
-  if (chosen === undefined) return [...agent.command]
-  const flag = agent.modelFlag ?? "--model"
-  return [...agent.command, flag, chosen]
-}
-
-function resolveEffectiveModel(
-  agent: AgentConfig,
-  opts: { model?: string; complexity?: ComplexityTier },
-): string | undefined {
-  // Explicit model takes precedence.
-  if (opts.model !== undefined) return opts.model
-  // Complexity tier maps to a model via complexityModels.
-  if (opts.complexity !== undefined && agent.complexityModels !== undefined) {
-    const tier = agent.complexityModels[opts.complexity]
-    if (tier !== undefined) return tier
-  }
-  // Fall back to agent defaultModel, or undefined (agent's built-in default).
-  return agent.defaultModel
-}
-
-// ============================================================================
 // resolveRoute — when agent is omitted, look up routing table for the
-// effective complexity tier.  Falls back to the agent marked default:true
+// effective complexity tier. Falls back to the agent marked default:true
 // or agents[0].
-// ============================================================================
-
 function resolveRoute(
   routing: RoutingTable | undefined,
-  agents: AgentConfig[],
+  agents: CoreAgentConfig[],
   complexity: ComplexityTier | undefined,
-): { agent: AgentConfig; model: string | undefined } {
+): { agent: CoreAgentConfig; model: string | undefined } {
   const tier: ComplexityTier = complexity ?? "mid"
 
   // Scan the routing table for matching entries in order.
@@ -1294,158 +805,49 @@ function resolveRoute(
   }
 
   // No routing entry matched. Fall back to default agent.
-  // Return model: undefined so resolveEffectiveModel handles complexityModels.
+  // Return model: undefined so resolveModel handles complexityModels.
   const fallback = agents.find((a) => a.default) ?? agents[0]
   return { agent: fallback, model: undefined }
 }
 
-function snippet(prompt: string, max: number): string {
-  const cleaned = prompt.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim()
-  return cleaned.length <= max ? cleaned : cleaned.slice(0, max - 1) + "\u2026"
-}
+// ============================================================================
+// HostAdapter bridge — adapts opencode's ToolContext to the shared-core's
+// HostAdapter interface.
+// ============================================================================
 
-function applyStopReasonTrailer(
-  toolPrefix: string,
-  output: string,
-  stopReason: AcpStopReason | undefined,
-  durationMs: number,
-): { output: string; status: DelegationStatus } {
-  if (stopReason === undefined || stopReason === "end_turn") return { output, status: "complete" }
-  if (stopReason === "refusal") {
-    const reason = output.trim().length > 0 ? output.trim() : "no reason given"
-    return { output: `${toolPrefix} refused: ${reason}`, status: "error" }
+function makeHost(ctx: ToolContext): HostAdapter {
+  return {
+    getDirectory: (_args?: { directoryArg?: string }) => ctx.directory,
+    getSessionId: () => ctx.sessionID.slice(0, 6),
+    getAbortSignal: () => ctx.abort,
+    reportProgress: (m: Record<string, unknown>) =>
+      ctx.metadata(m as { title?: string; metadata?: Record<string, unknown> }),
+    namespace: OPENCODE_NAMESPACE,
   }
-  if (stopReason === "cancelled") {
-    return { output: `${toolPrefix} cancelled by agent.`, status: "cancelled" }
-  }
-  const trailer = `\n\n[${toolPrefix}: stopReason=${stopReason}, durationMs=${durationMs}]`
-  return { output: output + trailer, status: "complete" }
 }
 
-interface ExecuteOutcome {
-  output: string
-  status: DelegationStatus
-  stopReason?: AcpStopReason
-  errorCode?: string
-  durationMs: number
-  outputBytes: number
-}
+// ============================================================================
+// Delegate wrapper — bridges the opencode tool handler to core runDelegation
+// ============================================================================
 
-async function runDelegation(
-  agent: AgentConfig,
-  args: { prompt: string; includeContext?: string[]; model?: string },
-  ctx: {
-    sessionID?: string
-    directory: string
-    abort?: AbortSignal
-    metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void
-  },
+async function localRunDelegation(
+  agent: CoreAgentConfig,
+  args: { prompt: string; includeContext?: string[]; model?: string; complexity?: ComplexityTier },
+  ctx: ToolContext,
   toolPrefix?: string,
 ): Promise<{ output: string; metadata: Record<string, unknown> }> {
-  const prefix = toolPrefix ?? `delegate_to_${agent.id}`
-  const startedAt = Date.now()
-  const callId = randomUUID()
-  const sessionIdShort = String(ctx.sessionID ?? "").slice(0, 6)
-  const promptSnippet = snippet(args.prompt, PROMPT_SNIPPET_MAX)
-
-  ctx.metadata?.({ title: `[${agent.id}] ${snippet(args.prompt, TITLE_PROMPT_MAX)}` })
-
-  void recordInflight({
-    callId,
-    sessionId: sessionIdShort,
-    agentId: agent.id,
-    promptSnippet,
-    startedAt,
-  }).catch(() => {})
-
-  const finalize = (outcome: ExecuteOutcome): { output: string; metadata: Record<string, unknown> } => {
-    const endedAt = Date.now()
-    void resolveInflight(callId, {
-      status: outcome.status,
-      endedAt,
-      durationMs: outcome.durationMs,
-      ...(outcome.errorCode !== undefined ? { errorCode: outcome.errorCode } : {}),
-    }).catch(() => {})
-    const usage: UsageEntry = {
-      ts: endedAt,
-      callId,
-      sessionId: sessionIdShort,
-      agentId: agent.id,
-      status: outcome.status,
-      durationMs: outcome.durationMs,
-      promptBytes: Buffer.byteLength(args.prompt, "utf8"),
-      outputBytes: outcome.outputBytes,
-      ...(outcome.errorCode !== undefined ? { errorCode: outcome.errorCode } : {}),
-      ...(outcome.stopReason !== undefined ? { stopReason: outcome.stopReason } : {}),
-    }
-    void appendUsage(usage).catch(() => {})
-    return {
-      output: outcome.output,
-      metadata: {
-        agentId: agent.id,
-        durationMs: outcome.durationMs,
-        status: outcome.status,
-        ...(outcome.stopReason !== undefined ? { stopReason: outcome.stopReason } : {}),
-        ...(outcome.errorCode !== undefined ? { errorCode: outcome.errorCode } : {}),
-        ...(args.model !== undefined ? { model: args.model } : {}),
-      },
-    }
-  }
-
-  try {
-    const preamble = args.includeContext && args.includeContext.length > 0
-      ? await buildContextPreamble(ctx.directory, args.includeContext)
-      : ""
-    const fullPrompt = preamble + args.prompt
-    const command = buildSpawnCommand(agent, args.model)
-
-    const result = await runOneShotSession(
-      {
-        command,
-        cwd: ctx.directory,
-        timeout: agent.timeout ?? DEFAULT_TIMEOUT_MS,
-        signal: ctx.abort,
-        autoApprove: agent.autoApprove ?? true,
-      },
-      fullPrompt,
-    )
-    const durationMs = result.metadata.durationMs
-    const { output, status } = applyStopReasonTrailer(
-      prefix,
-      result.output,
-      result.metadata.stopReason,
-      durationMs,
-    )
-    return finalize({
-      output,
-      status,
-      stopReason: result.metadata.stopReason,
-      durationMs,
-      outputBytes: Buffer.byteLength(output, "utf8"),
-    })
-  } catch (err) {
-    const durationMs = Date.now() - startedAt
-    if (err instanceof AcpAbortError) {
-      const output = `${prefix} cancelled.`
-      return finalize({
-        output,
-        status: "cancelled",
-        errorCode: err.code ?? "ECANCELLED",
-        durationMs,
-        outputBytes: Buffer.byteLength(output, "utf8"),
-      })
-    }
-    const e = err instanceof AcpError ? err : new AcpError(String(err))
-    const stderrTail = e.stderr ? `\n--- agent stderr (tail) ---\n${e.stderr}` : ""
-    const output = `${prefix} failed (${e.code ?? e.name}): ${e.message}${stderrTail}`
-    return finalize({
-      output,
-      status: "error",
-      errorCode: e.code ?? e.name,
-      durationMs,
-      outputBytes: Buffer.byteLength(output, "utf8"),
-    })
-  }
+  return coreRunDelegation(
+    agent,
+    {
+      prompt: args.prompt,
+      includeContext: args.includeContext,
+      model: args.model,
+      complexity: args.complexity,
+    },
+    makeHost(ctx),
+    null, // pool=null → one-shot mode (no session pooling)
+    undefined, // agents=undefined → no fallback/availability logic
+  )
 }
 
 const PROMPT_ARG = z
@@ -1470,16 +872,7 @@ const INCLUDE_CONTEXT_ARG = z
 // Tool factory — one opencode ToolDefinition per ACP agent
 // ============================================================================
 
-function makeDelegateTool(agent: AgentConfig): ToolDefinition {
-  const makeHost = (ctx: ToolContext): HostAdapter => ({
-    getDirectory: (_args?: { directoryArg?: string }) => ctx.directory,
-    getSessionId: () => ctx.sessionID.slice(0, 6),
-    getAbortSignal: () => ctx.abort,
-    reportProgress: (m) =>
-      ctx.metadata(m as { title?: string; metadata?: Record<string, unknown> }),
-    namespace: OPENCODE_NAMESPACE,
-  })
-
+function makeDelegateTool(agent: CoreAgentConfig): ToolDefinition {
   const hasModels = agent.models !== undefined && agent.models.length > 0
   const hasComplexity = agent.complexityModels !== undefined &&
     Object.values(agent.complexityModels).some((v) => typeof v === "string" && v.length > 0)
@@ -1522,8 +915,7 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
       args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, model: modelArg, complexity: complexityArg },
       execute: async (rawArgs, ctx) => {
         const args = rawArgs as { prompt: string; includeContext?: string[]; model?: string; complexity?: ComplexityTier }
-        const effectiveModel = resolveEffectiveModel(agent, { model: args.model, complexity: args.complexity })
-        const result = await runDelegation(agent, { prompt: args.prompt, includeContext: args.includeContext, model: effectiveModel }, makeHost(ctx))
+        const result = await localRunDelegation(agent, args, ctx)
         if (args.complexity !== undefined) result.metadata.complexity = args.complexity
         return result
       },
@@ -1546,7 +938,7 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
     return tool({
       description: describeAgent(agent),
       args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, model: modelArg },
-      execute: async (args, ctx) => runDelegation(agent, args, ctx),
+      execute: async (args, ctx) => localRunDelegation(agent, args, ctx),
     })
   }
 
@@ -1557,8 +949,7 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
       args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, complexity: complexityArg },
       execute: async (rawArgs, ctx) => {
         const args = rawArgs as { prompt: string; includeContext?: string[]; complexity?: ComplexityTier }
-        const effectiveModel = resolveEffectiveModel(agent, { complexity: args.complexity })
-        const result = await runDelegation(agent, { prompt: args.prompt, includeContext: args.includeContext, model: effectiveModel }, makeHost(ctx))
+        const result = await localRunDelegation(agent, args, ctx)
         if (args.complexity !== undefined) result.metadata.complexity = args.complexity
         return result
       },
@@ -1569,7 +960,7 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
   return tool({
     description: describeAgent(agent),
     args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG },
-    execute: async (args, ctx) => runDelegation(agent, args, ctx),
+    execute: async (args, ctx) => localRunDelegation(agent, args, ctx),
   })
 }
 
@@ -1577,7 +968,7 @@ function makeDelegateTool(agent: AgentConfig): ToolDefinition {
 // Unified tool factory — single `acp_delegate` tool that routes by agent id
 // ============================================================================
 
-function describeUnifiedTool(registry: AgentConfig[], routing: RoutingTable | undefined): string {
+function describeUnifiedTool(registry: CoreAgentConfig[], routing: RoutingTable | undefined): string {
   const agentList = registry.map((a) => {
     const label = a.label ?? a.id
     const modelInfo = a.models && a.models.length > 0 ? ` (models: ${a.models.join(", ")})` : ""
@@ -1610,7 +1001,7 @@ function describeUnifiedTool(registry: AgentConfig[], routing: RoutingTable | un
   )
 }
 
-function makeUnifiedTool(registry: AgentConfig[], routing: RoutingTable | undefined): ToolDefinition {
+function makeUnifiedTool(registry: CoreAgentConfig[], routing: RoutingTable | undefined): ToolDefinition {
   const agentIds = registry.map((a) => a.id) as [string, ...string[]]
   const agentMap = new Map(registry.map((a) => [a.id, a]))
 
@@ -1695,19 +1086,14 @@ function makeUnifiedTool(registry: AgentConfig[], routing: RoutingTable | undefi
 // ============================================================================
 
 async function executeUnifiedDelegation(
-  agentMap: Map<string, AgentConfig>,
-  registry: AgentConfig[],
+  agentMap: Map<string, CoreAgentConfig>,
+  registry: CoreAgentConfig[],
   routing: RoutingTable | undefined,
   args: { prompt: string; agent?: string; model?: string; complexity?: ComplexityTier; includeContext?: string[] },
-  ctx: {
-    sessionID?: string
-    directory: string
-    abort?: AbortSignal
-    metadata: (input: { title?: string; metadata?: Record<string, unknown> }) => void
-  },
+  ctx: ToolContext,
 ): Promise<{ output: string; metadata: Record<string, unknown> }> {
   // Resolve agent: explicit > routing table > default.
-  let agent: AgentConfig
+  let agent: CoreAgentConfig
   let routingModel: string | undefined
 
   if (args.agent !== undefined) {
@@ -1741,7 +1127,7 @@ async function executeUnifiedDelegation(
   } else if (routingModel !== undefined) {
     effectiveModel = routingModel
   } else {
-    effectiveModel = resolveEffectiveModel(agent, { complexity: args.complexity })
+    effectiveModel = resolveModel(agent, { complexity: args.complexity })
   }
 
   // Validate effective model against agent.models when defined.
@@ -1759,11 +1145,12 @@ async function executeUnifiedDelegation(
     }
   }
 
-  // Delegate to runDelegation with the resolved model.
-  const result = await runDelegation(agent, {
+  // Delegate to core runDelegation via the local wrapper.
+  const result = await localRunDelegation(agent, {
     prompt: args.prompt,
     includeContext: args.includeContext,
     model: effectiveModel,
+    complexity: args.complexity,
   }, ctx, "acp_delegate")
 
   // Inject routing metadata.
@@ -1778,6 +1165,25 @@ async function executeUnifiedDelegation(
   return result
 }
 
+function buildUnifiedRoutingBlock(registry: CoreAgentConfig[], routing: RoutingTable | undefined): string {
+  const routingDesc = routing && routing.length > 0
+    ? `Routing: ${routing.map((r) => `${r.complexity ?? "*"}→${r.agent}${r.model ? `(${r.model})` : ""}`).join(", ")}.`
+    : "When 'agent' is omitted, the default agent is used."
+  return (
+    `<acp-delegate-routing>\n` +
+    `You can delegate self-contained tasks to external coding agents via the \`acp_delegate\` tool.\n\n` +
+    `- \`acp_delegate\` — Unified delegation tool. Pass \`agent\` to select the target ` +
+    `(or omit to auto-route via complexity). Pass \`complexity\` (high|mid|low) to select ` +
+    `the right model. ${routingDesc}\n\n` +
+    `Each call spawns a fresh subprocess — the prompt must be self-contained, no session memory. ` +
+    `Pass file/directory paths via \`includeContext\` to attach contents inline. Reach for delegation ` +
+    `when offloading bulk read-only analysis (5+ files), getting an independent second opinion, or ` +
+    `fanning out 3+ subtasks in parallel.\n\n` +
+    `Skip when: simple grep/search, single-file edits with exact path, multi-turn chains.\n` +
+    `</acp-delegate-routing>`
+  )
+}
+
 // ============================================================================
 // Plugin entry point
 // ============================================================================
@@ -1788,40 +1194,30 @@ const plugin: Plugin = async (_input: PluginInput, options?: OpencodePluginOptio
 
   // Fire-and-forget startup health probe; never blocks plugin load.
   void probeAll(registry)
-    .then((health: HealthEntry[]) => recordHealth(OPENCODE_NAMESPACE, health).catch(() => {}))
+    .then((health: HealthEntry[]) => setHealthResults(health))
     .catch(() => {})
 
   const tools: Record<string, ToolDefinition> = {}
-  for (const agent of registry) {
-    const name = `delegate_to_${sanitizeToolSuffix(agent.id)}`
-    tools[name] = makeDelegateTool(agent)
-  }
 
-  // Register the unified acp_delegate tool when opted in.
   if (enableUnifiedTool) {
+    // Unified mode: expose only acp_delegate as the single entry point.
+    // Per-agent delegate_to_<id> tools are NOT registered.
     tools["acp_delegate"] = makeUnifiedTool(registry, routing)
+  } else {
+    // Legacy mode: expose one tool per configured agent.
+    for (const agent of registry) {
+      const name = `delegate_to_${sanitizeToolSuffix(agent.id)}`
+      tools[name] = makeDelegateTool(agent)
+    }
   }
 
   // Optional system-prompt routing block. Off by default — opt in via
   // `injectSystemGuidance: true` in the JSON fallback config.
   const result: Awaited<ReturnType<Plugin>> = { tool: tools }
   if (injectSystemGuidance) {
-    let block = buildRoutingBlock(registry)
-    if (enableUnifiedTool) {
-      // Append unified tool entry to the routing block.
-      const routingDesc = routing && routing.length > 0
-        ? `Routing: ${routing.map((r) => `${r.complexity ?? "*"}→${r.agent}${r.model ? `(${r.model})` : ""}`).join(", ")}.`
-        : "When 'agent' is omitted, the default agent is used."
-      const unifiedEntry =
-        `\n- \`acp_delegate\` — Unified delegation tool. Pass \`agent\` to select the target ` +
-        `(or omit to auto-route via complexity). Pass \`complexity\` (high|mid|low) to select ` +
-        `the right model. ${routingDesc} ` +
-        `Use when you don't want to think about which delegate_to_<id> tool to call.`
-      block = block.replace(
-        "</acp-delegate-routing>",
-        unifiedEntry + "\n</acp-delegate-routing>"
-      )
-    }
+    const block = enableUnifiedTool
+      ? buildUnifiedRoutingBlock(registry, routing)
+      : buildRoutingBlock(registry)
     ;(result as Record<string, unknown>)["experimental.chat.system.transform"] = async (
       _input2: unknown,
       output: { system: string[] },
