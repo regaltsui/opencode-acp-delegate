@@ -1,15 +1,11 @@
 /**
- * opencode-acp-delegate — ACP delegation plugin for Opencode
- *
- * Exposes a single unified `acp_delegate` tool that routes to any configured
- * ACP agent by id via the shared core @regaltsui/acp-delegate. Each agent
- * drives a one-shot ACP session and returns the final text response synchronously.
- *
- * Legacy mode (enableUnifiedTool: false) keeps per-agent delegate_to_<id> tools
- * for backward compatibility. When enableUnifiedTool: true, only acp_delegate
- * is exposed as the sole entry point.
- *
- * CONFIGURATION: Provide agents via JSON or as tuple options in opencode.json:
+  * opencode-acp-delegate — ACP delegation plugin for Opencode
+  *
+  * Exposes a single unified `acp_delegate` tool that routes to any configured
+  * ACP agent by id via the shared core @regaltsui/acp-delegate. Each agent
+  * drives a one-shot ACP session and returns the final text response synchronously.
+  *
+  * CONFIGURATION: Provide agents via JSON or as tuple options in opencode.json:
  *   1. Tuple options (GitHub URL install in opencode.json)
  *   2. $OPENCODE_ACP_DELEGATE_CONFIG (path to a JSON file)
  *   3. ~/.config/opencode/acp-delegate.json
@@ -114,7 +110,7 @@ import {
   describeAgent,
   describeAgentFooter,
   summarizeAgent,
-  buildRoutingBlock,
+  
   buildSpawnCommand,
   resolveModel,
   // Functions — health
@@ -138,7 +134,7 @@ const z = tool.schema
 /** Extended config type — adds routing and unified-tool support on top of core. */
 interface AcpPluginOptions extends CoreAcpPluginOptions {
   routing?: RoutingTable
-  enableUnifiedTool?: boolean
+  
 }
 
 interface RoutingEntry {
@@ -191,7 +187,6 @@ function readFallbackConfigLocal(): CoreAcpPluginOptions | null {
 function resolvePluginOptions(opts: AcpPluginOptions): {
   agents: CoreAgentConfig[]
   injectSystemGuidance: boolean
-  enableUnifiedTool: boolean
   routing: RoutingTable | undefined
 } {
   let source: AcpPluginOptions | null =
@@ -202,12 +197,34 @@ function resolvePluginOptions(opts: AcpPluginOptions): {
   if (!source || !Array.isArray(source.agents) || source.agents.length === 0) {
     throw new Error(missingAgentsMessage(OPENCODE_NAMESPACE))
   }
-  const routing = validateRouting(source.routing, source.agents)
+
+  // opencode strips routing from plugin options — read it directly from config
+  let routing = source.routing
+  if (routing === undefined) {
+    try {
+      const raw = readFileSync(join(process.cwd(), ".opencode", "config.json"), "utf-8")
+      const parsed = JSON.parse(raw)
+      const plugins: unknown[] | undefined = parsed.plugin
+      if (Array.isArray(plugins)) {
+        for (const entry of plugins) {
+          if (!Array.isArray(entry) || entry.length < 2) continue
+          const [name, pOpts] = entry as [string, Record<string, unknown>]
+          if (typeof name === "string" && name.includes("opencode-acp-delegate")) {
+            if (pOpts && typeof pOpts === "object" && Array.isArray(pOpts.routing)) {
+              routing = pOpts.routing as RoutingTable
+            }
+            break
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const validatedRouting = validateRouting(routing, source.agents)
   return {
     agents: source.agents.map((raw, i) => validateAgent(raw as unknown, i)),
     injectSystemGuidance: source.injectSystemGuidance === true,
-    enableUnifiedTool: source.enableUnifiedTool === true,
-    routing,
+    routing: validatedRouting,
   }
 }
 
@@ -869,102 +886,6 @@ const INCLUDE_CONTEXT_ARG = z
   )
 
 // ============================================================================
-// Tool factory — one opencode ToolDefinition per ACP agent
-// ============================================================================
-
-function makeDelegateTool(agent: CoreAgentConfig): ToolDefinition {
-  const hasModels = agent.models !== undefined && agent.models.length > 0
-  const hasComplexity = agent.complexityModels !== undefined &&
-    Object.values(agent.complexityModels).some((v) => typeof v === "string" && v.length > 0)
-
-  // Build the complexity arg when complexityModels is populated.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let complexityArg: any = undefined
-  if (hasComplexity) {
-    const populatedTiers = (["high", "mid", "low"] as const).filter((t) => {
-      const v = agent.complexityModels?.[t]
-      return typeof v === "string" && v.length > 0
-    })
-    if (populatedTiers.length > 0) {
-      complexityArg = z
-        .enum(populatedTiers as [string, ...string[]])
-        .optional()
-        .describe(
-          `Optional. Complexity tier that selects a model via the agent's 'complexityModels' map. ` +
-          `Ignored when 'model' is also supplied. ` +
-          `Tiers: ${populatedTiers.map((t) => `${t} → ${agent.complexityModels![t]}`).join(", ")}.`,
-        )
-    }
-  }
-
-  // Both models + complexity
-  if (hasModels && complexityArg !== undefined) {
-    const models = agent.models!
-    const modelArg = z
-      .enum(models as [string, ...string[]])
-      .optional()
-      .describe(
-        `Optional. Model id passed to the agent via '${agent.modelFlag ?? "--model"}'. ` +
-          `Allowed values: ${models.join(", ")}. ` +
-          (agent.defaultModel !== undefined
-            ? `Defaults to '${agent.defaultModel}' when omitted.`
-            : "Omit to use the agent's built-in default."),
-      )
-    return tool({
-      description: describeAgent(agent),
-      args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, model: modelArg, complexity: complexityArg },
-      execute: async (rawArgs, ctx) => {
-        const args = rawArgs as { prompt: string; includeContext?: string[]; model?: string; complexity?: ComplexityTier }
-        const result = await localRunDelegation(agent, args, ctx)
-        if (args.complexity !== undefined) result.metadata.complexity = args.complexity
-        return result
-      },
-    })
-  }
-
-  // Models only, no complexity
-  if (hasModels) {
-    const models = agent.models!
-    const modelArg = z
-      .enum(models as [string, ...string[]])
-      .optional()
-      .describe(
-        `Optional. Model id passed to the agent via '${agent.modelFlag ?? "--model"}'. ` +
-          `Allowed values: ${models.join(", ")}. ` +
-          (agent.defaultModel !== undefined
-            ? `Defaults to '${agent.defaultModel}' when omitted.`
-            : "Omit to use the agent's built-in default."),
-      )
-    return tool({
-      description: describeAgent(agent),
-      args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, model: modelArg },
-      execute: async (args, ctx) => localRunDelegation(agent, args, ctx),
-    })
-  }
-
-  // Complexity only, no explicit models list
-  if (complexityArg !== undefined) {
-    return tool({
-      description: describeAgent(agent),
-      args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG, complexity: complexityArg },
-      execute: async (rawArgs, ctx) => {
-        const args = rawArgs as { prompt: string; includeContext?: string[]; complexity?: ComplexityTier }
-        const result = await localRunDelegation(agent, args, ctx)
-        if (args.complexity !== undefined) result.metadata.complexity = args.complexity
-        return result
-      },
-    })
-  }
-
-  // Neither models nor complexity — basic tool
-  return tool({
-    description: describeAgent(agent),
-    args: { prompt: PROMPT_ARG, includeContext: INCLUDE_CONTEXT_ARG },
-    execute: async (args, ctx) => localRunDelegation(agent, args, ctx),
-  })
-}
-
-// ============================================================================
 // Unified tool factory — single `acp_delegate` tool that routes by agent id
 // ============================================================================
 
@@ -1190,39 +1111,23 @@ function buildUnifiedRoutingBlock(registry: CoreAgentConfig[], routing: RoutingT
 
 const plugin: Plugin = async (_input: PluginInput, options?: OpencodePluginOptions) => {
   const config = (options ?? {}) as unknown as AcpPluginOptions
-  const { agents: registry, injectSystemGuidance, enableUnifiedTool, routing } = resolvePluginOptions(config)
+  const { agents: registry, injectSystemGuidance, routing } = resolvePluginOptions(config)
 
-  // Fire-and-forget startup health probe; never blocks plugin load.
   void probeAll(registry)
     .then((health: HealthEntry[]) => setHealthResults(health))
     .catch(() => {})
 
-  const tools: Record<string, ToolDefinition> = {}
-
-  if (enableUnifiedTool) {
-    // Unified mode: expose only acp_delegate as the single entry point.
-    // Per-agent delegate_to_<id> tools are NOT registered.
-    tools["acp_delegate"] = makeUnifiedTool(registry, routing)
-  } else {
-    // Legacy mode: expose one tool per configured agent.
-    for (const agent of registry) {
-      const name = `delegate_to_${sanitizeToolSuffix(agent.id)}`
-      tools[name] = makeDelegateTool(agent)
-    }
+  const tools: Record<string, ToolDefinition> = {
+    acp_delegate: makeUnifiedTool(registry, routing),
   }
 
-  // Optional system-prompt routing block. Off by default — opt in via
-  // `injectSystemGuidance: true` in the JSON fallback config.
   const result: Awaited<ReturnType<Plugin>> = { tool: tools }
   if (injectSystemGuidance) {
-    const block = enableUnifiedTool
-      ? buildUnifiedRoutingBlock(registry, routing)
-      : buildRoutingBlock(registry)
     ;(result as Record<string, unknown>)["experimental.chat.system.transform"] = async (
       _input2: unknown,
       output: { system: string[] },
     ): Promise<void> => {
-      output.system.push(block)
+      output.system.push(buildUnifiedRoutingBlock(registry, routing))
     }
   }
   return result
